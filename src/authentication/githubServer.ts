@@ -5,10 +5,15 @@ import { agent } from '../env/node/net';
 import { HostHelper } from './configuration';
 
 export class GitHubManager {
-	private _servers: Map<string, boolean> = new Map().set('github.com', true);
+	private _servers: Map<string, boolean> = new Map().set('github.com', true).set('ssh.github.com', true);
 
 	public async isGitHub(host: vscode.Uri): Promise<boolean> {
 		if (host === null) {
+			return false;
+		}
+
+		// .wiki/.git repos are not supported
+		if (host.path.endsWith('.wiki') || host.authority.match(/gist[.]github[.]com/)) {
 			return false;
 		}
 
@@ -21,7 +26,8 @@ export class GitHubManager {
 		let isGitHub = false;
 		try {
 			const response = await fetch(uri.toString(), options);
-			isGitHub = response.headers['x-github-request-id'] !== undefined;
+			const gitHubHeader = response.headers.get('x-github-request-id');
+			isGitHub = ((gitHubHeader !== undefined) && (gitHubHeader !== null));
 			return isGitHub;
 		} catch (ex) {
 			Logger.appendLine(`No response from host ${host}: ${ex.message}`, 'GitHubServer');

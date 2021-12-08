@@ -139,6 +139,17 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 		});
 	}
 
+	/**
+	 * Find currently configured user's review status for the current PR
+	 * @param reviewers All the reviewers who have been requested to review the current PR
+	 * @param pullRequestModel Model of the PR
+	 */
+	private getCurrentUserReviewState(reviewers: ReviewState[], currentUser: IAccount): string | undefined {
+		const review = reviewers.find(r => r.reviewer.login === currentUser.login);
+		// There will always be a review. If not then the PR shouldn't have been or fetched/shown for the current user
+		return review?.state;
+	}
+
 	public async updatePullRequest(pullRequestModel: PullRequestModel): Promise<void> {
 		return Promise.all([
 			this._folderRepositoryManager.resolvePullRequest(
@@ -151,6 +162,7 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 			pullRequestModel.getStatusChecks(),
 			pullRequestModel.getReviewRequests(),
 			this._folderRepositoryManager.getPullRequestRepositoryAccessAndMergeMethods(pullRequestModel),
+			this._folderRepositoryManager.getBranchNameForPullRequest(pullRequestModel),
 		])
 			.then(result => {
 				const [
@@ -160,6 +172,7 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 					status,
 					requestedReviewers,
 					repositoryAccess,
+					branchInfo,
 				] = result;
 				if (!pullRequest) {
 					throw new Error(
@@ -188,7 +201,7 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 					!pullRequest.base.repositoryCloneUrl.equals(pullRequest.head.repositoryCloneUrl);
 
 				const continueOnGitHub = isCrossRepository && isInCodespaces();
-
+				const reviewState = this.getCurrentUserReviewState(this._existingReviewers, currentUser);
 				Logger.debug('pr.initialize', PullRequestOverviewPanel.ID);
 				this._postMessage({
 					command: 'pr.initialize',
@@ -209,8 +222,11 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 						state: pullRequest.state,
 						events: timelineEvents,
 						isCurrentlyCheckedOut: isCurrentlyCheckedOut,
-						base: (pullRequest.base && pullRequest.base.label) || 'UNKNOWN',
-						head: (pullRequest.head && pullRequest.head.label) || 'UNKNOWN',
+						isRemoteBaseDeleted: pullRequest.isRemoteBaseDeleted,
+						base: pullRequest.base.label,
+						isRemoteHeadDeleted: pullRequest.isRemoteHeadDeleted,
+						isLocalHeadDeleted: !branchInfo,
+						head: pullRequest.head?.label ?? '',
 						repositoryDefaultBranch: defaultBranch,
 						canEdit: canEdit,
 						hasWritePermission,
@@ -225,6 +241,7 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 						assignees: pullRequest.assignees,
 						continueOnGitHub,
 						isAuthor: currentUser.login === pullRequest.author.login,
+						currentUserReviewState: reviewState
 					},
 				});
 			})
@@ -305,13 +322,13 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 
 	private async getReviewersQuickPickItems(
 		suggestedReviewers: ISuggestedReviewer[] | undefined,
-	): Promise<(vscode.QuickPickItem & { reviewer: IAccount })[]> {
+	): Promise<(vscode.QuickPickItem & { reviewer?: IAccount })[]> {
 		if (!suggestedReviewers) {
 			return [];
 		}
 
 		const allAssignableUsers = await this._folderRepositoryManager.getAssignableUsers();
-		const assignableUsers = allAssignableUsers[this._item.remote.remoteName];
+		const assignableUsers = allAssignableUsers[this._item.remote.remoteName] ?? [];
 
 		// used to track logins that shouldn't be added to pick list
 		// e.g. author, existing and already added reviewers
@@ -320,7 +337,7 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 			...this._existingReviewers.map(reviewer => reviewer.reviewer.login),
 		]);
 
-		const reviewers: (vscode.QuickPickItem & { reviewer: IAccount })[] = [];
+		const reviewers: (vscode.QuickPickItem & { reviewer?: IAccount })[] = [];
 		for (const user of suggestedReviewers) {
 			const { login, name, isAuthor, isCommenter } = user;
 			if (skipList.has(login)) {
@@ -358,20 +375,27 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 			});
 		}
 
+		if (reviewers.length === 0) {
+			reviewers.push({
+				label: 'No reviewers available for this repository'
+			});
+		}
+
 		return reviewers;
 	}
 	private getAssigneesQuickPickItems(
-		assignableUsers: IAccount[],
+		assignableUsers: IAccount[] | undefined,
 		suggestedReviewers: ISuggestedReviewer[] | undefined,
-	): (vscode.QuickPickItem & { assignee: IAccount })[] {
+	): (vscode.QuickPickItem & { assignee?: IAccount })[] {
 		if (!suggestedReviewers) {
 			return [];
 		}
+		assignableUsers = assignableUsers ?? [];
 		// used to track logins that shouldn't be added to pick list
 		// e.g. author, existing and already added reviewers
-		const skipList: Set<string> = new Set([...this._item.assignees.map(assignee => assignee.login)]);
+		const skipList: Set<string> = new Set([...(this._item.assignees?.map(assignee => assignee.login) ?? [])]);
 
-		const assignees: (vscode.QuickPickItem & { assignee: IAccount })[] = [];
+		const assignees: (vscode.QuickPickItem & { assignee?: IAccount })[] = [];
 		for (const suggestedReviewer of suggestedReviewers) {
 			const { login, name, isAuthor, isCommenter } = suggestedReviewer;
 			if (skipList.has(login)) {
@@ -409,18 +433,24 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 			});
 		}
 
+		if (assignees.length === 0) {
+			assignees.push({
+				label: 'No assignees available for this repository'
+			});
+		}
+
 		return assignees;
 	}
 
 	private async addReviewers(message: IRequestMessage<void>): Promise<void> {
 		try {
-			const reviewersToAdd = await vscode.window.showQuickPick(
+			const reviewersToAdd: (vscode.QuickPickItem & { reviewer: IAccount })[] | undefined = (await vscode.window.showQuickPick(
 				this.getReviewersQuickPickItems(this._item.suggestedReviewers),
 				{
 					canPickMany: true,
 					matchOnDescription: true,
 				},
-			);
+			))?.filter(item => item.reviewer) as (vscode.QuickPickItem & { reviewer: IAccount })[] | undefined;
 
 			if (reviewersToAdd) {
 				await this._item.requestReview(reviewersToAdd.map(r => r.label));
@@ -496,17 +526,17 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 			const allAssignableUsers = await this._folderRepositoryManager.getAssignableUsers();
 			const assignableUsers = allAssignableUsers[this._item.remote.remoteName];
 
-			const assigneesToAdd = await vscode.window.showQuickPick(
+			const assigneesToAdd = (await vscode.window.showQuickPick(
 				this.getAssigneesQuickPickItems(assignableUsers, []),
 				{
 					canPickMany: true,
 					matchOnDescription: true,
 				},
-			);
+			))?.filter(item => item.assignee) as (vscode.QuickPickItem & { assignee: IAccount })[] | undefined;;
 
 			if (assigneesToAdd) {
 				const addedAssignees: IAccount[] = assigneesToAdd.map(item => item.assignee);
-				this._item.assignees = this._item.assignees.concat(addedAssignees);
+				this._item.assignees = this._item.assignees?.concat(addedAssignees);
 
 				await this._item.updateAssignees(addedAssignees.map(assignee => assignee.login));
 
@@ -536,8 +566,8 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 		try {
 			await this._item.deleteAssignees(message.args);
 
-			const index = this._item.assignees.findIndex(assignee => assignee.login === message.args);
-			this._item.assignees.splice(index, 1);
+			const index = this._item.assignees?.findIndex(assignee => assignee.login === message.args) ?? -1;
+			this._item.assignees?.splice(index, 1);
 
 			this._replyMessage(message, {});
 		} catch (e) {
@@ -622,7 +652,7 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 			const branchHeadRef = this._item.head.ref;
 
 			const isDefaultBranch = this._repositoryDefaultBranch === this._item.head.ref;
-			if (!isDefaultBranch) {
+			if (!isDefaultBranch && !this._item.isRemoteHeadDeleted) {
 				actions.push({
 					label: `Delete remote branch ${this._item.remote.remoteName}/${branchHeadRef}`,
 					description: `${this._item.remote.normalizedHost}/${this._item.remote.owner}/${this._item.remote.repositoryName}`,
@@ -678,6 +708,8 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 			ignoreFocusOut: true,
 		});
 
+		const deletedBranchTypes: string[] = [];
+
 		if (selectedActions) {
 			const isBranchActive = this._item.equals(this._folderRepositoryManager.activePullRequest);
 
@@ -685,6 +717,7 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 				switch (action.type) {
 					case 'upstream':
 						await this._folderRepositoryManager.deleteBranch(this._item);
+						deletedBranchTypes.push(action.type);
 						return this._folderRepositoryManager.repository.fetch({ prune: true });
 					case 'local':
 						if (isBranchActive) {
@@ -702,10 +735,13 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 							}
 							await this._folderRepositoryManager.repository.checkout(this._repositoryDefaultBranch);
 						}
-						return await this._folderRepositoryManager.repository.deleteBranch(branchInfo!.branch, true);
+						await this._folderRepositoryManager.repository.deleteBranch(branchInfo!.branch, true);
+						return deletedBranchTypes.push(action.type);
 					case 'remote':
+						deletedBranchTypes.push(action.type);
 						return this._folderRepositoryManager.repository.removeRemote(branchInfo!.remote!);
 					case 'suspend':
+						deletedBranchTypes.push(action.type);
 						return vscode.commands.executeCommand('github.codespaces.disconnectSuspend');
 				}
 			});
@@ -717,6 +753,7 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 
 			this._postMessage({
 				command: 'pr.deleteBranch',
+				branchTypes: deletedBranchTypes
 			});
 		} else {
 			this._replyMessage(message, {

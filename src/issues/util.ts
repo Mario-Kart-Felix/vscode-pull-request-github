@@ -36,7 +36,6 @@ export type ParsedIssue = {
 export const ISSUES_CONFIGURATION: string = 'githubIssues';
 export const QUERIES_CONFIGURATION = 'queries';
 export const DEFAULT_QUERY_CONFIGURATION = 'default';
-export const BRANCH_NAME_CONFIGURATION_DEPRECATED = 'workingIssueBranch';
 export const BRANCH_NAME_CONFIGURATION = 'issueBranchTitle';
 export const BRANCH_CONFIGURATION = 'useBranchForIssues';
 export const SCM_MESSAGE_CONFIGURATION = 'workingIssueFormatScm';
@@ -157,10 +156,10 @@ function convertHexToRgb(hex: string): { r: number; g: number; b: number } | und
 	const result = /^([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
 	return result
 		? {
-				r: parseInt(result[1], 16),
-				g: parseInt(result[2], 16),
-				b: parseInt(result[3], 16),
-		  }
+			r: parseInt(result[1], 16),
+			g: parseInt(result[2], 16),
+			b: parseInt(result[3], 16),
+		}
 		: undefined;
 }
 
@@ -427,27 +426,41 @@ async function getUpstream(repository: Repository, commit: Commit): Promise<Remo
 export async function createGithubPermalink(
 	gitAPI: GitApiImpl,
 	positionInfo?: NewIssue,
-): Promise<{ permalink: string | undefined; error: string | undefined }> {
-	let document: vscode.TextDocument;
-	let range: vscode.Range;
-	if (!positionInfo && vscode.window.activeTextEditor) {
-		document = vscode.window.activeTextEditor.document;
+	fileUri?: vscode.Uri
+): Promise<{ permalink: string | undefined; error: string | undefined, originalFile: vscode.Uri | undefined }> {
+	let uri: vscode.Uri;
+	let range: vscode.Range | undefined;
+	if (fileUri) {
+		uri = fileUri;
+		if (vscode.window.activeTextEditor?.document.uri.fsPath === uri.fsPath) {
+			range = vscode.window.activeTextEditor.selection;
+		}
+	} else if (!positionInfo && vscode.window.activeTextEditor) {
+		uri = vscode.window.activeTextEditor.document.uri;
 		range = vscode.window.activeTextEditor.selection;
 	} else if (positionInfo) {
-		document = positionInfo.document;
+		uri = positionInfo.document.uri;
 		range = positionInfo.range;
 	} else {
-		return { permalink: undefined, error: 'No active text editor position to create permalink from.' };
+		return { permalink: undefined, error: 'No active text editor position to create permalink from.', originalFile: undefined };
 	}
 
-	const repository = getRepositoryForFile(gitAPI, document.uri);
+	const repository = getRepositoryForFile(gitAPI, uri);
 	if (!repository) {
-		return { permalink: undefined, error: "The current file isn't part of repository." };
+		return { permalink: undefined, error: "The current file isn't part of repository.", originalFile: uri };
 	}
 
-	const log = await repository.log({ maxEntries: 1, path: document.uri.fsPath });
-	if (log.length === 0) {
-		return { permalink: undefined, error: 'No branch on a remote contains the most recent commit for the file.' };
+	let commit: Commit | undefined;
+	let commitHash: string | undefined;
+	try {
+		const log = await repository.log({ maxEntries: 1, path: uri.fsPath });
+		if (log.length === 0) {
+			return { permalink: undefined, error: 'No branch on a remote contains the most recent commit for the file.', originalFile: uri };
+		}
+		commit = log[0];
+		commitHash = log[0].hash;
+	} catch (e) {
+		commitHash = repository.state.HEAD?.commit;
 	}
 
 	const fallbackUpstream = new Promise<Remote | undefined>(resolve => {
@@ -461,32 +474,43 @@ export async function createGithubPermalink(
 		resolve(undefined);
 	});
 
-	let upstream: Remote | undefined = await Promise.race([
-		getUpstream(repository, log[0]),
+	let upstream: Remote | undefined = commit ? await Promise.race([
+		getUpstream(repository, commit),
 		new Promise<Remote | undefined>(resolve => {
 			setTimeout(() => {
 				resolve(fallbackUpstream);
-			}, 2000);
+			}, 1500);
 		}),
-	]);
+	]) : await fallbackUpstream;
+
 	if (!upstream || !upstream.fetchUrl) {
 		// Check fallback
 		upstream = await fallbackUpstream;
 		if (!upstream || !upstream.fetchUrl) {
-			return { permalink: undefined, error: 'There is no suitable remote.' };
+			return { permalink: undefined, error: 'The selection may not exist on any remote.', originalFile: uri };
 		}
 	}
-	const pathSegment = document.uri.path.substring(repository.rootUri.path.length);
+	const pathSegment = uri.path.substring(repository.rootUri.path.length);
+	const rangeString = () => {
+		if (!range) {
+			return '';
+		}
+		let hash = `#L${range.start.line + 1}`;
+		if (range.start.line !== range.end.line) {
+			hash += `-L${range.end.line + 1}`;
+		}
+		return hash;
+	};
 	return {
-		permalink: `https://github.com/${new Protocol(upstream.fetchUrl).nameWithOwner}/blob/${
-			log[0].hash
-		}${pathSegment}#L${range.start.line + 1}-L${range.end.line + 1}`,
+		permalink: `https://github.com/${new Protocol(upstream.fetchUrl).nameWithOwner}/blob/${commitHash
+			}${pathSegment}${rangeString()}`,
 		error: undefined,
+		originalFile: uri
 	};
 }
 
 export function sanitizeIssueTitle(title: string): string {
-	const regex = /[~^:;'".,~#?%*[\]@\\{}]|\/\//g;
+	const regex = /[~^:;'".,~#?%*[\]@\\{}()]|\/\//g;
 
 	return title.replace(regex, '').trim().replace(/\s+/g, '-');
 }
@@ -514,6 +538,8 @@ export async function variableSubstitution(
 				return defaults ? defaults.owner : match;
 			case 'sanitizedIssueTitle':
 				return issueModel ? sanitizeIssueTitle(issueModel.title) : match; // check what characters are permitted
+			case 'sanitizedLowercaseIssueTitle':
+				return issueModel ? sanitizeIssueTitle(issueModel.title).toLowerCase() : match;
 			default:
 				return match;
 		}

@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 'use strict';
 
+import * as crypto from 'crypto';
 import * as vscode from 'vscode';
 import { Repository } from '../api/api';
 import { GitApiImpl } from '../api/api1';
@@ -13,6 +14,8 @@ import { Resource } from '../common/resources';
 import * as Common from '../common/timelineEvent';
 import { uniqBy } from '../common/utils';
 import { OctokitCommon } from './common';
+import { AuthProvider } from './credentials';
+import { SETTINGS_NAMESPACE } from './folderRepositoryManager';
 import { GitHubRepository, ViewerPermission } from './githubRepository';
 import * as GraphQL from './graphql';
 import {
@@ -41,7 +44,7 @@ export function createVSCodeCommentThreadForReviewThread(
 ): GHPRCommentThread {
 	const vscodeThread = commentController.createCommentThread(uri, range, []);
 
-	(vscodeThread as GHPRCommentThread).threadId = thread.id;
+	(vscodeThread as GHPRCommentThread).gitHubThreadId = thread.id;
 
 	vscodeThread.comments = thread.comments.map(comment => new GHPRComment(comment, vscodeThread as GHPRCommentThread));
 	(vscodeThread as GHPRCommentThread).isResolved = thread.isResolved;
@@ -53,14 +56,28 @@ export function createVSCodeCommentThreadForReviewThread(
 	}
 
 	updateCommentThreadLabel(vscodeThread as GHPRCommentThread);
-	vscodeThread.collapsibleState = thread.isResolved
-			? vscode.CommentThreadCollapsibleState.Collapsed
-			: vscode.CommentThreadCollapsibleState.Expanded;
+	vscodeThread.collapsibleState = getCommentCollapsibleState(thread.isResolved);
 
 	return vscodeThread as GHPRCommentThread;
 }
 
-export function updateThread(vscodeThread: GHPRCommentThread, reviewThread: IReviewThread) {
+
+export const COMMENT_EXPAND_STATE_SETTING = 'commentExpandState';
+export const COMMENT_EXPAND_STATE_COLLAPSE_VALUE = 'collapseAll';
+export const COMMENT_EXPAND_STATE_EXPAND_VALUE = 'expandUnresolved';
+export function getCommentCollapsibleState(isResolved: boolean, expand?: boolean) {
+	if (isResolved) {
+		return vscode.CommentThreadCollapsibleState.Collapsed;
+	}
+	if (expand === undefined) {
+		const config = vscode.workspace.getConfiguration(SETTINGS_NAMESPACE)?.get(COMMENT_EXPAND_STATE_SETTING);
+		expand = config === COMMENT_EXPAND_STATE_EXPAND_VALUE;
+	}
+	return expand
+		? vscode.CommentThreadCollapsibleState.Expanded : vscode.CommentThreadCollapsibleState.Collapsed;
+}
+
+export function updateThread(vscodeThread: GHPRCommentThread, reviewThread: IReviewThread, expand?: boolean) {
 	if (reviewThread.viewerCanResolve && !reviewThread.isResolved) {
 		vscodeThread.contextValue = 'canResolve';
 	} else if (reviewThread.viewerCanUnresolve && reviewThread.isResolved) {
@@ -69,10 +86,8 @@ export function updateThread(vscodeThread: GHPRCommentThread, reviewThread: IRev
 
 	if (vscodeThread.isResolved !== reviewThread.isResolved) {
 		vscodeThread.isResolved = reviewThread.isResolved;
-		vscodeThread.collapsibleState = reviewThread.isResolved
-			? vscode.CommentThreadCollapsibleState.Collapsed
-			: vscode.CommentThreadCollapsibleState.Expanded;
 	}
+	vscodeThread.collapsibleState = getCommentCollapsibleState(reviewThread.isResolved, expand);
 
 	vscodeThread.comments = reviewThread.comments.map(c => new GHPRComment(c, vscodeThread));
 	updateCommentThreadLabel(vscodeThread);
@@ -141,7 +156,7 @@ export function convertRESTUserToAccount(
 	return {
 		login: user.login,
 		url: user.html_url,
-		avatarUrl: githubRepository.isGitHubDotCom ? user.avatar_url : undefined,
+		avatarUrl: getAvatarWithEnterpriseFallback(user.avatar_url, user.gravatar_id ?? undefined, githubRepository.remote.authProviderId),
 	};
 }
 
@@ -183,14 +198,14 @@ export function convertRESTPullRequestToRawPullRequest(
 		id,
 		graphNodeId: node_id,
 		number,
-		body,
+		body: body ?? '',
 		title,
 		url: html_url,
-		user: convertRESTUserToAccount(user, githubRepository),
+		user: convertRESTUserToAccount(user!, githubRepository),
 		state,
 		merged: (pullRequest as OctokitCommon.PullsGetResponseData).merged || false,
 		assignees: assignees
-			? assignees.map(assignee => convertRESTUserToAccount(assignee, githubRepository))
+			? assignees.map(assignee => convertRESTUserToAccount(assignee!, githubRepository))
 			: undefined,
 		createdAt: created_at,
 		updatedAt: updated_at,
@@ -230,18 +245,18 @@ export function convertRESTIssueToRawPullRequest(
 		id,
 		graphNodeId: node_id,
 		number,
-		body,
+		body: body ?? '',
 		title,
 		url: html_url,
-		user: convertRESTUserToAccount(user, githubRepository),
+		user: convertRESTUserToAccount(user!, githubRepository),
 		state,
 		assignees: assignees
-			? assignees.map(assignee => convertRESTUserToAccount(assignee, githubRepository))
+			? assignees.map(assignee => convertRESTUserToAccount(assignee!, githubRepository))
 			: undefined,
 		createdAt: created_at,
 		updatedAt: updated_at,
 		labels: labels.map<ILabel>(l =>
-			typeof l === 'string' ? { name: l, color: '' } : { name: '', color: '', ...l },
+			typeof l === 'string' ? { name: l, color: '' } : { name: l.name ?? '', color: l.color ?? '' },
 		),
 		suggestedReviewers: [], // suggested reviewers only available through GraphQL API
 	};
@@ -260,15 +275,15 @@ export function convertRESTReviewEvent(
 		body: review.body,
 		bodyHTML: review.body,
 		htmlUrl: review.html_url,
-		user: convertRESTUserToAccount(review.user, githubRepository),
-		authorAssociation: review.user.type,
+		user: convertRESTUserToAccount(review.user!, githubRepository),
+		authorAssociation: review.user!.type,
 		state: review.state as 'COMMENTED' | 'APPROVED' | 'CHANGES_REQUESTED' | 'PENDING',
 		id: review.id,
 	};
 }
 
 export function parseCommentDiffHunk(comment: IComment): DiffHunk[] {
-	const diffHunks = [];
+	const diffHunks: DiffHunk[] = [];
 	const diffHunkReader = parseDiffHunk(comment.diffHunk);
 	let diffHunkIter = diffHunkReader.next();
 
@@ -288,14 +303,14 @@ export function convertPullRequestsGetCommentsResponseItemToComment(
 	const ret: IComment = {
 		url: comment.url,
 		id: comment.id,
-		pullRequestReviewId: comment.pull_request_review_id,
+		pullRequestReviewId: comment.pull_request_review_id ?? undefined,
 		diffHunk: comment.diff_hunk,
 		path: comment.path,
 		position: comment.position,
 		commitId: comment.commit_id,
 		originalPosition: comment.original_position,
 		originalCommitId: comment.original_commit_id,
-		user: convertRESTUserToAccount(comment.user, githubRepository),
+		user: convertRESTUserToAccount(comment.user!, githubRepository),
 		body: comment.body,
 		createdAt: comment.created_at,
 		htmlUrl: comment.html_url,
@@ -416,29 +431,31 @@ export function parseGraphQLReaction(reactionGroups: GraphQL.ReactionGroup[]): R
 	return reactions;
 }
 
-function parseRef(ref: GraphQL.Ref | undefined): IGitHubRef | undefined {
-	if (ref) {
-		return {
-			label: `${ref.repository.owner.login}:${ref.name}`,
-			ref: ref.name,
-			sha: ref.target.oid,
-			repo: {
-				cloneUrl: ref.repository.url,
-			},
-		};
+function parseRef(refName: string, oid: string, repository?: GraphQL.RefRepository): IGitHubRef | undefined {
+	if (!repository) {
+		return undefined;
 	}
-	return undefined;
+
+	return {
+		label: `${repository.owner.login}:${refName}`,
+		ref: refName,
+		sha: oid,
+		repo: {
+			cloneUrl: repository.url,
+		},
+	};
 }
 
 function parseAuthor(
-	author: { login: string; url: string; avatarUrl: string } | null,
+	author: { login: string; url: string; avatarUrl: string; email?: string } | null,
 	githubRepository: GitHubRepository,
 ): IAccount {
 	if (author) {
 		return {
 			login: author.login,
 			url: author.url,
-			avatarUrl: githubRepository.isGitHubDotCom ? author.avatarUrl : undefined,
+			avatarUrl: getAvatarWithEnterpriseFallback(author.avatarUrl, undefined, githubRepository.remote.authProviderId),
+			email: author.email
 		};
 	} else {
 		return {
@@ -490,8 +507,10 @@ export function parseGraphQLPullRequest(
 		title: graphQLPullRequest.title,
 		createdAt: graphQLPullRequest.createdAt,
 		updatedAt: graphQLPullRequest.updatedAt,
-		head: parseRef(graphQLPullRequest.headRef),
-		base: parseRef(graphQLPullRequest.baseRef),
+		isRemoteHeadDeleted: !graphQLPullRequest.headRef,
+		head: parseRef(graphQLPullRequest.headRef?.name ?? graphQLPullRequest.headRefName, graphQLPullRequest.headRefOid, graphQLPullRequest.headRepository),
+		isRemoteBaseDeleted: !graphQLPullRequest.baseRef,
+		base: parseRef(graphQLPullRequest.baseRef?.name ?? graphQLPullRequest.baseRefName, graphQLPullRequest.baseRefOid, graphQLPullRequest.baseRepository),
 		user: parseAuthor(graphQLPullRequest.author, githubRepository),
 		merged: graphQLPullRequest.merged,
 		mergeable: parseMergeability(graphQLPullRequest.mergeable),
@@ -500,7 +519,7 @@ export function parseGraphQLPullRequest(
 		suggestedReviewers: parseSuggestedReviewers(graphQLPullRequest.suggestedReviewers),
 		comments: parseComments(graphQLPullRequest.comments?.nodes, githubRepository),
 		milestone: parseMilestone(graphQLPullRequest.milestone),
-		assignees: graphQLPullRequest.assignees?.nodes,
+		assignees: graphQLPullRequest.assignees?.nodes.map(assignee => parseAuthor(assignee, githubRepository)),
 	};
 }
 
@@ -536,7 +555,7 @@ export function parseGraphQLIssue(issue: GraphQL.PullRequest, githubRepository: 
 		title: issue.title,
 		createdAt: issue.createdAt,
 		updatedAt: issue.updatedAt,
-		assignees: issue.assignees.nodes,
+		assignees: issue.assignees?.nodes.map(assignee => parseAuthor(assignee, githubRepository)),
 		user: parseAuthor(issue.author, githubRepository),
 		labels: issue.labels.nodes,
 		repositoryName: issue.repository?.name,
@@ -562,8 +581,10 @@ export function parseGraphQLIssuesRequest(
 		title: graphQLPullRequest.title,
 		createdAt: graphQLPullRequest.createdAt,
 		updatedAt: graphQLPullRequest.updatedAt,
-		head: parseRef(graphQLPullRequest.headRef),
-		base: parseRef(graphQLPullRequest.baseRef),
+		isRemoteHeadDeleted: !graphQLPullRequest.headRef,
+		head: parseRef(graphQLPullRequest.headRef?.name ?? graphQLPullRequest.headRefName, graphQLPullRequest.headRefOid, graphQLPullRequest.headRepository),
+		isRemoteBaseDeleted: !graphQLPullRequest.baseRef,
+		base: parseRef(graphQLPullRequest.baseRef?.name ?? graphQLPullRequest.baseRefName, graphQLPullRequest.baseRefOid, graphQLPullRequest.baseRepository),
 		user: parseAuthor(graphQLPullRequest.author, githubRepository),
 		merged: graphQLPullRequest.merged,
 		mergeable: parseMergeability(graphQLPullRequest.mergeable),
@@ -724,11 +745,11 @@ export function parseGraphQLTimelineEvents(
 	return normalizedEvents;
 }
 
-export function parseGraphQLUser(user: GraphQL.UserResponse): User {
+export function parseGraphQLUser(user: GraphQL.UserResponse, githubRepository: GitHubRepository): User {
 	return {
 		login: user.user.login,
 		name: user.user.name,
-		avatarUrl: user.user.avatarUrl,
+		avatarUrl: user.user.avatarUrl ? getAvatarWithEnterpriseFallback(user.user.avatarUrl, undefined, githubRepository.remote.authProviderId) : undefined,
 		url: user.user.url,
 		bio: user.user.bio,
 		company: user.user.company,
@@ -923,4 +944,24 @@ export function getPRFetchQuery(repo: string, user: string, query: string): stri
 
 export function isInCodespaces(): boolean {
 	return vscode.env.remoteName === 'codespaces' && vscode.env.uiKind === vscode.UIKind.Web;
+}
+
+export function getEnterpriseUri(): vscode.Uri | undefined {
+	const config: string = vscode.workspace.getConfiguration('github-enterprise').get<string>('uri', '');
+	if (config) {
+		return vscode.Uri.parse(config, true);
+	}
+}
+
+export function hasEnterpriseUri(): boolean {
+	return !!getEnterpriseUri();
+}
+
+export function generateGravatarUrl(gravatarId: string | undefined, size: number = 200): string | undefined {
+	return !!gravatarId ? `https://www.gravatar.com/avatar/${gravatarId}?s=${size}&d=retro` : undefined;
+}
+
+export function getAvatarWithEnterpriseFallback(avatarUrl: string, email: string | undefined, authProviderId: AuthProvider): string | undefined {
+	return authProviderId === AuthProvider.github ? avatarUrl : (email ? generateGravatarUrl(
+		crypto.createHash('md5').update(email?.trim()?.toLowerCase()).digest('hex')) : undefined);
 }

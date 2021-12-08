@@ -12,7 +12,6 @@ import { IssueState, StateManager } from './stateManager';
 import {
 	BRANCH_CONFIGURATION,
 	BRANCH_NAME_CONFIGURATION,
-	BRANCH_NAME_CONFIGURATION_DEPRECATED,
 	ISSUES_CONFIGURATION,
 	SCM_MESSAGE_CONFIGURATION,
 	variableSubstitution,
@@ -77,7 +76,12 @@ export class CurrentIssue {
 					vscode.workspace.getConfiguration('githubIssues').get('assignWhenWorking') &&
 					!this.issueModel.assignees?.find(value => value.login === login)
 				) {
-					await this.manager.assignIssue(this.issueModel, login);
+					// Check that we have a repo open for this issue and only try to assign in that case.
+					if (this.manager.gitHubRepositories.find(
+						r => r.remote.owner === this.issueModel.remote.owner && r.remote.repositoryName === this.issueModel.remote.repositoryName,
+					)) {
+						await this.manager.assignIssue(this.issueModel, login);
+					}
 					await this.stateManager.refresh();
 				}
 				return true;
@@ -127,9 +131,11 @@ export class CurrentIssue {
 			}
 			return true;
 		} catch (e) {
-			vscode.window.showErrorMessage(
-				`Unable to checkout branch ${branch}. There may be file conflicts that prevent this branch change. Git error: ${e.error}`,
-			);
+			if (e.message !== 'User aborted') {
+				vscode.window.showErrorMessage(
+					`Unable to checkout branch ${branch}. There may be file conflicts that prevent this branch change. Git error: ${e.error}`,
+				);
+			}
 			return false;
 		}
 	}
@@ -141,23 +147,7 @@ export class CurrentIssue {
 		return this.user;
 	}
 
-	// TODO: #1972 Delete the deprecated setting
-	private async ensureBranchTitleConfigMigrated(): Promise<string> {
-		const configuration = vscode.workspace.getConfiguration(ISSUES_CONFIGURATION);
-		const deprecatedConfigInspect = configuration.inspect(BRANCH_NAME_CONFIGURATION_DEPRECATED);
-		async function migrate(value: any, target: vscode.ConfigurationTarget) {
-			await configuration.update(BRANCH_NAME_CONFIGURATION, value, target);
-			await configuration.update(BRANCH_NAME_CONFIGURATION_DEPRECATED, undefined, target);
-		}
-		if (deprecatedConfigInspect?.globalValue) {
-			await migrate(deprecatedConfigInspect.globalValue, vscode.ConfigurationTarget.Global);
-		}
-		if (deprecatedConfigInspect?.workspaceValue) {
-			await migrate(deprecatedConfigInspect.workspaceValue, vscode.ConfigurationTarget.Workspace);
-		}
-		if (deprecatedConfigInspect?.workspaceFolderValue) {
-			await migrate(deprecatedConfigInspect.workspaceFolderValue, vscode.ConfigurationTarget.WorkspaceFolder);
-		}
+	private async getBranchTitle(): Promise<string> {
 		return (
 			vscode.workspace.getConfiguration(ISSUES_CONFIGURATION).get<string>(BRANCH_NAME_CONFIGURATION) ??
 			this.getBasicBranchName(await this.getUser())
@@ -194,36 +184,40 @@ export class CurrentIssue {
 		}
 		const state: IssueState = this.stateManager.getSavedIssueState(this.issueModel.number);
 		this._branchName = this.shouldPromptForBranch ? undefined : state.branch;
-		if (!this._branchName) {
-			const branchNameConfig = await variableSubstitution(
-				await this.ensureBranchTitleConfigMigrated(),
-				this.issue,
-				undefined,
-				await this.getUser(),
-			);
-			if (createBranchConfig === 'on') {
-				const validateBranchName = this.validateBranchName(branchNameConfig);
-				if (validateBranchName) {
-					this.showBranchNameError(validateBranchName);
-					return false;
-				}
+		const branchNameConfig = await variableSubstitution(
+			await this.getBranchTitle(),
+			this.issue,
+			undefined,
+			await this.getUser(),
+		);
+		if ((createBranchConfig === 'on') && this._branchName !== branchNameConfig) {
+			const branchExists = await this.branchExists(this._branchName!);
+			if (!branchExists) {
 				this._branchName = branchNameConfig;
-			} else {
-				this._branchName = await vscode.window.showInputBox({
-					value: branchNameConfig,
-					prompt: 'Enter the label for the new branch.',
-				});
 			}
+		}
+		if (!this._branchName) {
+			this._branchName = await vscode.window.showInputBox({
+				value: branchNameConfig,
+				prompt: 'Enter the label for the new branch.',
+			});
 		}
 		if (!this._branchName) {
 			// user has cancelled
 			return false;
 		}
 
+		const validateBranchName = this.validateBranchName(this._branchName);
+		if (validateBranchName) {
+			this.showBranchNameError(validateBranchName);
+			return false;
+		}
+
 		state.branch = this._branchName;
-		this.stateManager.setSavedIssueState(this.issueModel, state);
+		await this.stateManager.setSavedIssueState(this.issueModel, state);
 		if (!(await this.createOrCheckoutBranch(this._branchName))) {
 			this._branchName = undefined;
+			return false;
 		}
 		return true;
 	}

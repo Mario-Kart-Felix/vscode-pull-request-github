@@ -6,14 +6,14 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { Repository, UpstreamRef } from '../api/api';
-import { Protocol } from '../common/protocol';
-import { Remote } from '../common/remote';
+import { ISessionState } from '../common/sessionState';
 import { ITelemetry } from '../common/telemetry';
 import { EventType } from '../common/timelineEvent';
-import { CredentialStore } from './credentials';
+import { compareIgnoreCase } from '../common/utils';
+import { AuthProvider, CredentialStore } from './credentials';
 import { FolderRepositoryManager, ReposManagerState, ReposManagerStateContext } from './folderRepositoryManager';
-import { GitHubRepository } from './githubRepository';
 import { IssueModel } from './issueModel';
+import { hasEnterpriseUri } from './utils';
 
 export interface ItemsResponseResult<T> {
 	items: T[];
@@ -56,8 +56,6 @@ export class BadUpstreamError extends Error {
 	}
 }
 
-export const REMOTES_SETTING = 'remotes';
-
 export interface PullRequestDefaults {
 	owner: string;
 	repo: string;
@@ -80,6 +78,7 @@ export class RepositoriesManager implements vscode.Disposable {
 		private _folderManagers: FolderRepositoryManager[],
 		private _credentialStore: CredentialStore,
 		private _telemetry: ITelemetry,
+		private readonly _sessionState: ISessionState
 	) {
 		this._subs = [];
 		vscode.commands.executeCommand('setContext', ReposManagerStateContext, this._state);
@@ -147,12 +146,16 @@ export class RepositoriesManager implements vscode.Disposable {
 	}
 
 	getManagerForFile(uri: vscode.Uri): FolderRepositoryManager | undefined {
+		if (uri.scheme === 'untitled') {
+			return this._folderManagers[0];
+		}
+
 		for (const folderManager of this._folderManagers) {
 			const managerPath = folderManager.repository.rootUri.path;
 			const testUriRelativePath = uri.path.substring(
 				managerPath.length > 1 ? managerPath.length + 1 : managerPath.length,
 			);
-			if (vscode.Uri.joinPath(folderManager.repository.rootUri, testUriRelativePath).path === uri.path) {
+			if (compareIgnoreCase(vscode.Uri.joinPath(folderManager.repository.rootUri, testUriRelativePath).path, uri.path) === 0) {
 				return folderManager;
 			}
 		}
@@ -182,16 +185,12 @@ export class RepositoriesManager implements vscode.Disposable {
 	}
 
 	async authenticate(): Promise<boolean> {
-		return !!(await this._credentialStore.login());
-	}
-
-	createGitHubRepository(remote: Remote, credentialStore: CredentialStore): GitHubRepository {
-		return new GitHubRepository(remote, credentialStore, this._telemetry);
-	}
-
-	createGitHubRepositoryFromOwnerName(owner: string, name: string): GitHubRepository {
-		const uri = `https://github.com/${owner}/${name}`;
-		return new GitHubRepository(new Remote(name, uri, new Protocol(uri)), this._credentialStore, this._telemetry);
+		const github = await this._credentialStore.login(AuthProvider.github);
+		let githubEnterprise;
+		if (hasEnterpriseUri()) {
+			githubEnterprise = await this._credentialStore.login(AuthProvider['github-enterprise']);
+		}
+		return !!github || !!githubEnterprise;
 	}
 
 	dispose() {

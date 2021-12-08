@@ -6,10 +6,11 @@
 'use strict';
 
 import * as pathUtils from 'path';
-import { EventEmitter, Uri, UriHandler } from 'vscode';
+import * as vscode from 'vscode';
 import { Repository } from '../api/api';
 import { PullRequestModel } from '../github/pullRequestModel';
 import { GitChangeType } from './file';
+import { TemporaryState } from './temporaryState';
 
 export interface ReviewUriParams {
 	path: string;
@@ -20,8 +21,8 @@ export interface ReviewUriParams {
 	rootPath: string;
 }
 
-export function fromReviewUri(uri: Uri): ReviewUriParams {
-	return JSON.parse(uri.query);
+export function fromReviewUri(query: string): ReviewUriParams {
+	return JSON.parse(query);
 }
 
 export interface PRUriParams {
@@ -34,10 +35,10 @@ export interface PRUriParams {
 	remoteName: string;
 }
 
-export function fromPRUri(uri: Uri): PRUriParams | undefined {
+export function fromPRUri(uri: vscode.Uri): PRUriParams | undefined {
 	try {
 		return JSON.parse(uri.query) as PRUriParams;
-	} catch (e) {}
+	} catch (e) { }
 }
 
 export interface GitHubUriParams {
@@ -45,10 +46,10 @@ export interface GitHubUriParams {
 	branch: string;
 	isEmpty?: boolean;
 }
-export function fromGitHubURI(uri: Uri): GitHubUriParams | undefined {
+export function fromGitHubURI(uri: vscode.Uri): GitHubUriParams | undefined {
 	try {
 		return JSON.parse(uri.query) as GitHubUriParams;
-	} catch (e) {}
+	} catch (e) { }
 }
 
 export interface GitUriOptions {
@@ -60,15 +61,15 @@ export interface GitUriOptions {
 const ImageMimetypes = ['image/png', 'image/gif', 'image/jpeg', 'image/webp', 'image/tiff', 'image/bmp'];
 
 // a 1x1 pixel transparent gif, from http://png-pixel.com/
-export const EMPTY_IMAGE_URI = Uri.parse(
+export const EMPTY_IMAGE_URI = vscode.Uri.parse(
 	`data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==`,
 );
 
-export async function asImageDataURI(uri: Uri, repository: Repository): Promise<Uri | undefined> {
+export async function asImageDataURI(uri: vscode.Uri, repository: Repository): Promise<vscode.Uri | undefined> {
 	try {
-		const { commit, baseCommit, headCommit, isBase } = JSON.parse(uri.query);
+		const { commit, baseCommit, headCommit, isBase, path } = JSON.parse(uri.query);
 		const ref = uri.scheme === 'review' ? commit : isBase ? baseCommit : headCommit;
-		const { size, object } = await repository.getObjectDetails(ref, uri.fsPath);
+		const { object } = await repository.getObjectDetails(ref, uri.fsPath);
 		const { mimetype } = await repository.detectObjectType(object);
 
 		if (mimetype === 'text/plain') {
@@ -77,11 +78,7 @@ export async function asImageDataURI(uri: Uri, repository: Repository): Promise<
 
 		if (ImageMimetypes.indexOf(mimetype) > -1) {
 			const contents = await repository.buffer(ref, uri.fsPath);
-			return Uri.parse(
-				`data:${mimetype};label:${pathUtils.basename(
-					uri.fsPath,
-				)};description:${ref};size:${size};base64,${contents.toString('base64')}`,
-			);
+			return TemporaryState.write(pathUtils.dirname(path), pathUtils.basename(path), contents);
 		}
 	} catch (err) {
 		return;
@@ -89,14 +86,14 @@ export async function asImageDataURI(uri: Uri, repository: Repository): Promise<
 }
 
 export function toReviewUri(
-	uri: Uri,
+	uri: vscode.Uri,
 	filePath: string | undefined,
 	ref: string | undefined,
 	commit: string,
 	isOutdated: boolean,
 	options: GitUriOptions,
-	rootUri: Uri,
-): Uri {
+	rootUri: vscode.Uri,
+): vscode.Uri {
 	const params: ReviewUriParams = {
 		path: filePath ? filePath : uri.path,
 		ref,
@@ -125,7 +122,7 @@ export interface FileChangeNodeUriParams {
 	status?: GitChangeType;
 }
 
-export function toResourceUri(uri: Uri, prNumber: number, fileName: string, status: GitChangeType) {
+export function toResourceUri(uri: vscode.Uri, prNumber: number, fileName: string, status: GitChangeType) {
 	const params = {
 		prNumber: prNumber,
 		fileName: fileName,
@@ -138,21 +135,21 @@ export function toResourceUri(uri: Uri, prNumber: number, fileName: string, stat
 	});
 }
 
-export function fromFileChangeNodeUri(uri: Uri): FileChangeNodeUriParams | undefined {
+export function fromFileChangeNodeUri(uri: vscode.Uri): FileChangeNodeUriParams | undefined {
 	try {
-		return JSON.parse(uri.query) as FileChangeNodeUriParams;
-	} catch (e) {}
+		return uri.query ? JSON.parse(uri.query) as FileChangeNodeUriParams : undefined;
+	} catch (e) { }
 }
 
 export function toPRUri(
-	uri: Uri,
+	uri: vscode.Uri,
 	pullRequestModel: PullRequestModel,
 	baseCommit: string,
 	headCommit: string,
 	fileName: string,
 	base: boolean,
 	status: GitChangeType,
-): Uri {
+): vscode.Uri {
 	const params: PRUriParams = {
 		baseCommit: baseCommit,
 		headCommit: headCommit,
@@ -172,8 +169,20 @@ export function toPRUri(
 	});
 }
 
-class UriEventHandler extends EventEmitter<Uri> implements UriHandler {
-	public handleUri(uri: Uri) {
+export enum Schemas {
+	file = 'file'
+}
+
+export function resolvePath(from: vscode.Uri, to: string) {
+	if (from.scheme === Schemas.file) {
+		return pathUtils.resolve(from.fsPath, to);
+	} else {
+		return pathUtils.posix.resolve(from.path, to);
+	}
+}
+
+class UriEventHandler extends vscode.EventEmitter<vscode.Uri> implements vscode.UriHandler {
+	public handleUri(uri: vscode.Uri) {
 		this.fire(uri);
 	}
 }

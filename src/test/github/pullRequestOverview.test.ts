@@ -1,6 +1,5 @@
 import { default as assert } from 'assert';
 import * as vscode from 'vscode';
-import * as path from 'path';
 import { SinonSandbox, createSandbox, match as sinonMatch } from 'sinon';
 
 import { FolderRepositoryManager } from '../../github/folderRepositoryManager';
@@ -17,8 +16,9 @@ import { MockExtensionContext } from '../mocks/mockExtensionContext';
 import { MockGitHubRepository } from '../mocks/mockGitHubRepository';
 import { GitApiImpl } from '../../api/api1';
 import { CredentialStore } from '../../github/credentials';
+import { MockSessionState } from '../mocks/mockSessionState';
 
-const EXTENSION_URI = vscode.Uri.file(path.resolve(__dirname, '../../..'));
+const EXTENSION_URI = vscode.Uri.joinPath(vscode.Uri.file(__dirname), '../../..');
 
 describe('PullRequestOverview', function () {
 	let sinon: SinonSandbox;
@@ -36,7 +36,7 @@ describe('PullRequestOverview', function () {
 		const repository = new MockRepository();
 		telemetry = new MockTelemetry();
 		const credentialStore = new CredentialStore(telemetry);
-		pullRequestManager = new FolderRepositoryManager(context, repository, telemetry, new GitApiImpl(), credentialStore);
+		pullRequestManager = new FolderRepositoryManager(context, repository, telemetry, new GitApiImpl(), credentialStore, new MockSessionState());
 
 		const url = 'https://github.com/aaa/bbb';
 		remote = new Remote('origin', url, new Protocol(url));

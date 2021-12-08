@@ -10,14 +10,24 @@ import { PullRequest } from '../common/cache';
 import PullRequestContext from '../common/context';
 import { Reviewer } from '../components/reviewer';
 import { Dropdown } from './dropdown';
-import { alertIcon, checkIcon, deleteIcon, pendingIcon } from './icon';
+import { alertIcon, checkIcon, deleteIcon, mergeIcon, pendingIcon, skipIcon } from './icon';
 import { nbsp } from './space';
 import { Avatar } from './user';
 
-export const StatusChecks = ({ pr, isSimple }: { pr: PullRequest; isSimple: boolean }) => {
-	if (pr.isIssue) {
-		return null;
-	}
+const PRStatusMessage = ({ pr, isSimple }: { pr: PullRequest, isSimple: boolean }) => {
+	return pr.state === GithubItemStateEnum.Merged ? (
+		<div className="branch-status-message"><div className="branch-status-icon">{isSimple ? mergeIcon : null}</div> {'Pull request successfully merged.'}</div>
+	) : pr.state === GithubItemStateEnum.Closed ? (
+		<div className="branch-status-message">{'This pull request is closed.'}</div>
+	) : null;
+};
+
+const DeleteOption = ({ pr }: { pr: PullRequest }) => {
+	return pr.state === GithubItemStateEnum.Open ? null
+		: (<DeleteBranch {...pr} />);
+};
+
+const StatusChecks = ({ pr }: { pr: PullRequest }) => {
 	const { state, status } = pr;
 	const [showDetails, toggleDetails] = useReducer(
 		show => !show,
@@ -36,49 +46,71 @@ export const StatusChecks = ({ pr, isSimple }: { pr: PullRequest; isSimple: bool
 		}
 	}, status.statuses);
 
+	return ((state === GithubItemStateEnum.Open) && status.statuses.length) ? (
+		<>
+			<div className="status-section">
+				<div className="status-item">
+					<StateIcon state={status.state} />
+					 <div>{getSummaryLabel(status.statuses)}</div>
+					<a href="javascript:void(0)" aria-role="button" onClick={toggleDetails}>
+						{showDetails ? 'Hide' : 'Show'}
+					</a>
+				</div>
+				{showDetails ? <StatusCheckDetails statuses={status.statuses} /> : null}
+			</div>
+		</>
+	) : null;
+};
+
+const InlineReviewers = ({ pr, isSimple }: { pr: PullRequest, isSimple: boolean }) => {
+	return (isSimple && (pr.state === GithubItemStateEnum.Open))
+		? pr.reviewers
+			?
+			<> {
+				pr.reviewers.map(state => (
+					<Reviewer key={state.reviewer.login} {...state} canDelete={false} />
+				))
+			}</>
+			: null
+		: null;
+};
+
+export const StatusChecksSection = ({ pr, isSimple }: { pr: PullRequest; isSimple: boolean }) => {
+	if (pr.isIssue) {
+		return null;
+	}
+
 	return (
 		<div id="status-checks">
-			{state === GithubItemStateEnum.Merged ? (
+			{
 				<>
-					<div className="branch-status-message">{'Pull request successfully merged.'}</div>
-					<DeleteBranch {...pr} />
-				</>
-			) : state === GithubItemStateEnum.Closed ? (
-				<>
-					<div className="branch-status-message">{'This pull request is closed.'}</div>
-					<DeleteBranch {...pr} />
-				</>
-			) : (
-				<>
-					{status.statuses.length ? (
-						<>
-							<div className="status-section">
-								<div className="status-item">
-									<StateIcon state={status.state} />
-									<div>{getSummaryLabel(status.statuses)}</div>
-									<a aria-role="button" onClick={toggleDetails}>
-										{showDetails ? 'Hide' : 'Show'}
-									</a>
-								</div>
-								{showDetails ? <StatusCheckDetails statuses={status.statuses} /> : null}
-							</div>
-						</>
-					) : null}
-					{isSimple
-						? pr.reviewers
-							? pr.reviewers.map(state => (
-									<Reviewer key={state.reviewer.login} {...state} canDelete={false} />
-							  ))
-							: []
-						: null}
+					<PRStatusMessage pr={pr} isSimple={isSimple} />
+					<StatusChecks pr={pr} />
+					<InlineReviewers pr={pr} isSimple={isSimple} />
 					<MergeStatusAndActions pr={pr} isSimple={isSimple} />
+					<DeleteOption pr={pr} />
 				</>
-			)}
+			}
 		</div>
 	);
 };
 
 export const MergeStatusAndActions = ({ pr, isSimple }: { pr: PullRequest; isSimple: boolean }) => {
+	if (isSimple && (pr.state !== GithubItemStateEnum.Open)) {
+		const string = (pr.state === GithubItemStateEnum.Merged) ? 'Pull Request Merged' : 'Pull Request Closed';
+		return (
+			<div className="branch-status-container">
+				<form>
+					<button disabled={true} type="submit">
+						{string}
+					</button>
+				</form>
+			</div>
+		);
+	} else if (pr.state !== GithubItemStateEnum.Open) {
+		return null;
+	}
+
 	const { mergeable: _mergeable } = pr;
 
 	const [mergeable, setMergeability] = useState(_mergeable);
@@ -101,7 +133,7 @@ export const MergeStatusAndActions = ({ pr, isSimple }: { pr: PullRequest; isSim
 	);
 };
 
-export default StatusChecks;
+export default StatusChecksSection;
 
 export const MergeStatus = ({ mergeable, isSimple }: { mergeable: PullRequestMergeability; isSimple: boolean }) => {
 	return (
@@ -109,16 +141,16 @@ export const MergeStatus = ({ mergeable, isSimple }: { mergeable: PullRequestMer
 			{isSimple
 				? null
 				: mergeable === PullRequestMergeability.Mergeable
-				? checkIcon
-				: mergeable === PullRequestMergeability.NotMergeable
-				? deleteIcon
-				: pendingIcon}
+					? checkIcon
+					: mergeable === PullRequestMergeability.NotMergeable
+						? deleteIcon
+						: pendingIcon}
 			<div>
 				{mergeable === PullRequestMergeability.Mergeable
 					? 'This branch has no conflicts with the base branch.'
 					: mergeable === PullRequestMergeability.NotMergeable
-					? 'This branch has conflicts that must be resolved.'
-					: 'Checking if this branch can be merged...'}
+						? 'This branch has conflicts that must be resolved.'
+						: 'Checking if this branch can be merged...'}
 			</div>
 		</div>
 	);
@@ -220,7 +252,7 @@ export const DeleteBranch = (pr: PullRequest) => {
 	const { deleteBranch } = useContext(PullRequestContext);
 	const [isBusy, setBusy] = useState(false);
 
-	if (pr.head === 'UNKNOWN') {
+	if (pr.isRemoteHeadDeleted !== false && pr.isLocalHeadDeleted !== false) {
 		return <div />;
 	} else {
 		return (
@@ -240,7 +272,7 @@ export const DeleteBranch = (pr: PullRequest) => {
 						}
 					}}
 				>
-					<button disabled={isBusy} type="submit">
+					<button disabled={isBusy} className="secondary" type="submit">
 						Delete branch...
 					</button>
 				</form>
@@ -254,7 +286,8 @@ function ConfirmMerge({ pr, method, cancel }: { pr: PullRequest; method: MergeMe
 	const [isBusy, setBusy] = useState(false);
 
 	return (
-		<form
+		<div>
+			<form
 			onSubmit={async event => {
 				event.preventDefault();
 
@@ -280,7 +313,8 @@ function ConfirmMerge({ pr, method, cancel }: { pr: PullRequest; method: MergeMe
 				</button>
 				<input disabled={isBusy} type="submit" id="confirm-merge" value={MERGE_METHODS[method]} />
 			</div>
-		</form>
+			</form>
+		</div>
 	);
 }
 
@@ -331,7 +365,7 @@ const StatusCheckDetails = ({ statuses }: Partial<PullRequest['status']>) => (
 						{s.context} {s.description ? `— ${s.description}` : ''}
 					</span>
 				</div>
-				{!!s.target_url ? <a href={s.target_url}>Details</a> : null}
+				{!!s.target_url ? <a href={s.target_url} title={s.target_url}>Details</a> : null}
 			</div>
 		))}
 	</div>
@@ -343,13 +377,15 @@ function getSummaryLabel(statuses: any[]) {
 	for (const statusType of Object.keys(statusTypes)) {
 		const numOfType = statusTypes[statusType].length;
 		let statusAdjective = '';
-
 		switch (statusType) {
 			case 'success':
 				statusAdjective = 'successful';
 				break;
 			case 'failure':
 				statusAdjective = 'failed';
+				break;
+			case 'neutral':
+				statusAdjective = 'skipped';
 				break;
 			default:
 				statusAdjective = 'pending';
@@ -366,6 +402,8 @@ function getSummaryLabel(statuses: any[]) {
 
 function StateIcon({ state }: { state: string }) {
 	switch (state) {
+		case 'neutral':
+			return skipIcon;
 		case 'success':
 			return checkIcon;
 		case 'failure':

@@ -10,6 +10,7 @@ import { OctokitCommon } from '../github/common';
 import { FolderRepositoryManager, PullRequestDefaults } from '../github/folderRepositoryManager';
 import { IssueModel } from '../github/issueModel';
 import { RepositoriesManager } from '../github/repositoriesManager';
+import { getRepositoryForFile } from '../github/utils';
 import { ReviewManager } from '../view/reviewManager';
 import { CurrentIssue } from './currentIssue';
 import { IssueCompletionProvider } from './issueCompletionProvider';
@@ -41,15 +42,17 @@ import {
 const ISSUE_COMPLETIONS_CONFIGURATION = 'issueCompletions.enabled';
 const USER_COMPLETIONS_CONFIGURATION = 'userCompletions.enabled';
 
+const CREATING_ISSUE_FROM_FILE_CONTEXT = 'issues.creatingFromFile';
+
 export class IssueFeatureRegistrar implements vscode.Disposable {
 	private _stateManager: StateManager;
 	private createIssueInfo:
 		| {
-				document: vscode.TextDocument;
-				newIssue: NewIssue | undefined;
-				lineNumber: number | undefined;
-				insertIndex: number | undefined;
-		  }
+			document: vscode.TextDocument;
+			newIssue: NewIssue | undefined;
+			lineNumber: number | undefined;
+			insertIndex: number | undefined;
+		}
 		| undefined;
 
 	constructor(
@@ -110,12 +113,12 @@ export class IssueFeatureRegistrar implements vscode.Disposable {
 		this.context.subscriptions.push(
 			vscode.commands.registerCommand(
 				'issue.copyGithubPermalink',
-				() => {
+				(fileUri: any) => {
 					/* __GDPR__
 				"issue.copyGithubPermalink" : {}
 			*/
 					this.telemetry.sendTelemetryEvent('issue.copyGithubPermalink');
-					return this.copyPermalink();
+					return this.copyPermalink(fileUri instanceof vscode.Uri ? fileUri : undefined);
 				},
 				this,
 			),
@@ -332,12 +335,14 @@ export class IssueFeatureRegistrar implements vscode.Disposable {
 		this.context.subscriptions.push(
 			vscode.commands.registerCommand(
 				'issue.createIssueFromFile',
-				() => {
+				async () => {
 					/* __GDPR__
 				"issue.createIssueFromFile" : {}
 			*/
 					this.telemetry.sendTelemetryEvent('issue.createIssueFromFile');
-					return this.createIssueFromFile();
+					await vscode.commands.executeCommand('setContext', CREATING_ISSUE_FROM_FILE_CONTEXT, true);
+					await this.createIssueFromFile();
+					await vscode.commands.executeCommand('setContext', CREATING_ISSUE_FROM_FILE_CONTEXT, false);
 				},
 				this,
 			),
@@ -384,7 +389,7 @@ export class IssueFeatureRegistrar implements vscode.Disposable {
 		});
 	}
 
-	dispose() {}
+	dispose() { }
 
 	private documentFilters: Array<vscode.DocumentFilter | string> = [
 		{ language: 'php' },
@@ -444,19 +449,19 @@ export class IssueFeatureRegistrar implements vscode.Disposable {
 			disposable: vscode.Disposable | undefined;
 			configuration: string;
 		}[] = [
-			{
-				provider: IssueCompletionProvider,
-				trigger: '#',
-				disposable: undefined,
-				configuration: ISSUE_COMPLETIONS_CONFIGURATION,
-			},
-			{
-				provider: UserCompletionProvider,
-				trigger: '@',
-				disposable: undefined,
-				configuration: USER_COMPLETIONS_CONFIGURATION,
-			},
-		];
+				{
+					provider: IssueCompletionProvider,
+					trigger: '#',
+					disposable: undefined,
+					configuration: ISSUE_COMPLETIONS_CONFIGURATION,
+				},
+				{
+					provider: UserCompletionProvider,
+					trigger: '@',
+					disposable: undefined,
+					configuration: USER_COMPLETIONS_CONFIGURATION,
+				},
+			];
 		for (const element of providers) {
 			if (vscode.workspace.getConfiguration(ISSUES_CONFIGURATION).get(element.configuration, true)) {
 				this.context.subscriptions.push(
@@ -636,18 +641,25 @@ export class IssueFeatureRegistrar implements vscode.Disposable {
 	}
 
 	async doStartWorking(
-		repoManager: FolderRepositoryManager | undefined,
+		matchingRepoManager: FolderRepositoryManager | undefined,
 		issueModel: IssueModel,
 		needsBranchPrompt?: boolean,
 	) {
+		let repoManager = matchingRepoManager;
+		let githubRepository = issueModel.githubRepository;
+		let remote = issueModel.remote;
 		if (!repoManager) {
-			vscode.window.showErrorMessage(`There are no repositories open that match ${issueModel.remote.url}`);
-			return;
+			repoManager = await this.chooseRepo('Choose which repository you want to work on this isssue in.');
+			if (!repoManager) {
+				return;
+			}
+			githubRepository = await repoManager.getOrigin();
+			remote = githubRepository.remote;
 		}
 
-		const remoteNameResult = await repoManager.findUpstreamForItem(issueModel);
+		const remoteNameResult = await repoManager.findUpstreamForItem({githubRepository, remote});
 		if (remoteNameResult.needsFork) {
-			if ((await repoManager.tryOfferToFork(issueModel.githubRepository)) === undefined) {
+			if ((await repoManager.tryOfferToFork(githubRepository)) === undefined) {
 				return;
 			}
 		}
@@ -673,9 +685,12 @@ export class IssueFeatureRegistrar implements vscode.Disposable {
 	}
 
 	async stopWorking(issueModel: any) {
-		const folderManager = this.manager.getManagerForIssueModel(issueModel);
+		let folderManager = this.manager.getManagerForIssueModel(issueModel);
 		if (!folderManager) {
-			return;
+			folderManager = await this.chooseRepo('Choose which repository you want to stop working on this issue in.');
+			if (!folderManager) {
+				return;
+			}
 		}
 		if (
 			issueModel instanceof IssueModel &&
@@ -764,6 +779,25 @@ export class IssueFeatureRegistrar implements vscode.Disposable {
 		return this.createTodoIssue(undefined, await vscode.env.clipboard.readText());
 	}
 
+	private async createTodoIssueBody(newIssue?: NewIssue, issueBody?: string): Promise<string | undefined> {
+		if (issueBody || newIssue?.document.isUntitled) {
+			return issueBody;
+		}
+
+		let contents = '';
+		if (newIssue) {
+			const repository = getRepositoryForFile(this.gitAPI, newIssue.document.uri);
+			const changeAffectingFile = repository?.state.workingTreeChanges.find(value => value.uri.toString() === newIssue.document.uri.toString());
+			if (changeAffectingFile) {
+				// The file we're creating the issue for has uncommitted changes.
+				// Add a quote of the line so that the issue body is still meaningful.
+				contents = `\`\`\`\n${newIssue.line}\n\`\`\`\n\n`;
+			}
+		}
+		contents += (await createGithubPermalink(this.gitAPI, newIssue)).permalink;
+		return contents;
+	}
+
 	async createTodoIssue(newIssue?: NewIssue, issueBody?: string) {
 		let document: vscode.TextDocument;
 		let titlePlaceholder: string | undefined;
@@ -790,10 +824,7 @@ export class IssueFeatureRegistrar implements vscode.Disposable {
 			assignee = [matches[1]];
 		}
 		let title: string | undefined;
-		const body: string | undefined =
-			issueBody || newIssue?.document.isUntitled
-				? issueBody
-				: (await createGithubPermalink(this.gitAPI, newIssue)).permalink;
+		const body: string | undefined = await this.createTodoIssueBody(newIssue, issueBody);
 
 		const quickInput = vscode.window.createInputBox();
 		quickInput.value = titlePlaceholder ?? '';
@@ -845,9 +876,8 @@ export class IssueFeatureRegistrar implements vscode.Disposable {
 			return;
 		}
 		await vscode.workspace.fs.delete(bodyPath);
-		const assigneeLine = `${ASSIGNEES} ${
-			assignees && assignees.length > 0 ? assignees.map(value => '@' + value).join(', ') + ' ' : ''
-		}`;
+		const assigneeLine = `${ASSIGNEES} ${assignees && assignees.length > 0 ? assignees.map(value => '@' + value).join(', ') + ' ' : ''
+			}`;
 		const labelLine = `${LABELS} `;
 		const text = `${title ?? 'Issue Title'}\n
 ${assigneeLine}
@@ -908,9 +938,10 @@ ${body ?? ''}\n
 		const allLabels = (await folderManager.getLabels(undefined, createParams)).map(label => label.name);
 		const newLabels: string[] = [];
 		const filteredLabels: string[] = [];
-		createParams.labels?.forEach(label => {
-			if (typeof label !== 'string') {
-				label = label.name;
+		createParams.labels?.forEach(paramLabel => {
+			let label = typeof paramLabel === 'string' ? paramLabel : paramLabel.name;
+			if (!label) {
+				return;
 			}
 
 			if (allLabels.includes(label)) {
@@ -988,7 +1019,8 @@ ${body ?? ''}\n
 			folderManager = this.manager.getManagerForFile(document.uri);
 		} else if (originUri) {
 			folderManager = this.manager.getManagerForFile(originUri);
-		} else {
+		}
+		if (!folderManager) {
 			folderManager = await this.chooseRepo('Choose where to create the issue.');
 		}
 
@@ -1023,7 +1055,7 @@ ${body ?? ''}\n
 				const edit: vscode.WorkspaceEdit = new vscode.WorkspaceEdit();
 				const insertText: string =
 					vscode.workspace.getConfiguration(ISSUES_CONFIGURATION).get('createInsertFormat', 'number') ===
-					'number'
+						'number'
 						? `#${issue.number}`
 						: issue.html_url;
 				edit.insert(document.uri, new vscode.Position(lineNumber, insertIndex), ` ${insertText}`);
@@ -1048,18 +1080,36 @@ ${body ?? ''}\n
 		return false;
 	}
 
-	private async getPermalinkWithError(): Promise<string | undefined> {
-		const link = await createGithubPermalink(this.gitAPI);
+	private async getPermalinkWithError(fileUri?: vscode.Uri): Promise<{ permalink: string | undefined, originalFile: vscode.Uri | undefined }> {
+		const link = await createGithubPermalink(this.gitAPI, undefined, fileUri);
 		if (link.error) {
 			vscode.window.showWarningMessage(`Unable to create a GitHub permalink for the selection. ${link.error}`);
 		}
-		return link.permalink;
+		return link;
 	}
 
-	async copyPermalink() {
-		const link = await this.getPermalinkWithError();
-		if (link) {
-			return vscode.env.clipboard.writeText(link);
+	private async getContextualizedPermalink(file: vscode.Uri, link: string): Promise<string> {
+		let uri: vscode.Uri;
+		try {
+			uri = await vscode.env.asExternalUri(file);
+		} catch (e) {
+			// asExternalUri can throw when in the browser and the embedder doesn't set a uri resolver.
+			return link;
+		}
+		const authority = (uri.scheme === 'https' && /^(vscode|github)\./.test(uri.authority)) ? uri.authority : undefined;
+		if (!authority) {
+			return link;
+		}
+		const linkUri = vscode.Uri.parse(link);
+		const linkPath = /^(github)\./.test(uri.authority) ? linkUri.path : `/github${linkUri.path}`;
+		return linkUri.with({ authority, path: linkPath }).toString();
+	}
+
+	async copyPermalink(fileUri?: vscode.Uri) {
+		const link = await this.getPermalinkWithError(fileUri);
+		if (link.permalink) {
+			return vscode.env.clipboard.writeText(
+				link.originalFile ? (await this.getContextualizedPermalink(link.originalFile, link.permalink)) : link.permalink);
 		}
 	}
 
@@ -1088,15 +1138,16 @@ ${body ?? ''}\n
 	async copyMarkdownPermalink() {
 		const link = await this.getPermalinkWithError();
 		const selection = this.getMarkdownLinkText();
-		if (link && selection) {
-			return vscode.env.clipboard.writeText(`[${selection.trim()}](${link})`);
+		if (link.permalink && selection) {
+			return vscode.env.clipboard.writeText(`[${selection.trim()}](${link.permalink})`);
 		}
 	}
 
 	async openPermalink() {
 		const link = await this.getPermalinkWithError();
-		if (link) {
-			return vscode.env.openExternal(vscode.Uri.parse(link));
+		if (link.permalink) {
+			return vscode.env.openExternal(vscode.Uri.parse(
+				link.originalFile ? (await this.getContextualizedPermalink(link.originalFile, link.permalink)) : link.permalink));
 		}
 		return undefined;
 	}

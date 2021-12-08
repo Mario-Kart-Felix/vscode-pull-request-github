@@ -34,7 +34,10 @@ export interface PullRequest {
 	state: GithubItemStateEnum;
 	events: TimelineEvent[];
 	isCurrentlyCheckedOut: boolean;
+	isRemoteBaseDeleted?: boolean;
 	base: string;
+	isRemoteHeadDeleted?: boolean;
+	isLocalHeadDeleted?: boolean;
 	head: string;
 	labels: ILabel[];
 	assignees: IAccount[];
@@ -60,9 +63,9 @@ export interface PullRequest {
 	reviewers: ReviewState[];
 	isDraft?: boolean;
 	isIssue: boolean;
-
 	isAuthor?: boolean;
 	continueOnGitHub: boolean;
+	currentUserReviewState: string;
 }
 
 export function getState(): PullRequest {

@@ -16,7 +16,10 @@ export const PullRequestBuilder = createBuilderClass<PullRequest>()({
 	state: { default: GithubItemStateEnum.Open },
 	events: { default: [] },
 	isCurrentlyCheckedOut: { default: true },
+	isRemoteBaseDeleted: { default: false },
 	base: { default: 'main' },
+	isRemoteHeadDeleted: { default: false },
+	isLocalHeadDeleted: { default: false },
 	head: { default: 'my-fork:my-branch' },
 	labels: { default: [] },
 	commitsCount: { default: 10 },
@@ -35,4 +38,5 @@ export const PullRequestBuilder = createBuilderClass<PullRequest>()({
 	assignees: { default: [] },
 	milestone: { default: undefined },
 	continueOnGitHub: { default: false },
+	currentUserReviewState: { default: 'REQUESTED' }
 });

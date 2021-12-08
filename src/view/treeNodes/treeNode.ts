@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as vscode from 'vscode';
+import Logger from '../../common/logger';
 
 export interface BaseTreeNode {
 	reveal(element: TreeNode, options?: { select?: boolean; focus?: boolean; expand?: boolean | number }): Thenable<void>;
@@ -17,6 +18,7 @@ export abstract class TreeNode implements vscode.Disposable {
 	childrenDisposables: vscode.Disposable[];
 	parent: TreeNodeParent;
 	label?: string;
+	accessibilityInformation?: vscode.AccessibilityInformation;
 
 	constructor() {}
 	abstract getTreeItem(): vscode.TreeItem;
@@ -30,7 +32,11 @@ export abstract class TreeNode implements vscode.Disposable {
 		treeNode: TreeNode,
 		options?: { select?: boolean; focus?: boolean; expand?: boolean | number },
 	): Promise<void> {
-		return this.parent.reveal(treeNode || this, options);
+		try {
+			await this.parent.reveal(treeNode || this, options);
+		} catch (e) {
+			Logger.appendLine(e, 'TreeNode');
+		}
 	}
 
 	refresh(treeNode?: TreeNode): void {

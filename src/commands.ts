@@ -10,12 +10,14 @@ import { GitErrorCodes } from './api/api1';
 import { CommentReply, resolveCommentHandler } from './commentHandlerResolver';
 import { IComment } from './common/comment';
 import Logger from './common/logger';
+import { SessionState } from './common/sessionState';
 import { ITelemetry } from './common/telemetry';
 import { asImageDataURI } from './common/uri';
 import { formatError } from './common/utils';
 import { EXTENSION_ID } from './constants';
 import { CredentialStore } from './github/credentials';
 import { FolderRepositoryManager } from './github/folderRepositoryManager';
+import { GitHubRepository } from './github/githubRepository';
 import { PullRequest } from './github/interface';
 import { GHPRComment, TemporaryComment } from './github/prComment';
 import { PullRequestModel } from './github/pullRequestModel';
@@ -24,6 +26,7 @@ import { RepositoriesManager } from './github/repositoriesManager';
 import { isInCodespaces } from './github/utils';
 import { PullRequestsTreeDataProvider } from './view/prsTreeDataProvider';
 import { ReviewManager } from './view/reviewManager';
+import { CategoryTreeNode } from './view/treeNodes/categoryNode';
 import { CommitNode } from './view/treeNodes/commitNode';
 import { DescriptionNode } from './view/treeNodes/descriptionNode';
 import {
@@ -104,18 +107,13 @@ export async function openPullRequestOnGitHub(e: PRNode | DescriptionNode | Pull
 
 export function registerCommands(
 	context: vscode.ExtensionContext,
+	sessionState: SessionState,
 	reposManager: RepositoriesManager,
 	reviewManagers: ReviewManager[],
 	telemetry: ITelemetry,
 	credentialStore: CredentialStore,
 	tree: PullRequestsTreeDataProvider,
 ) {
-	context.subscriptions.push(
-		vscode.commands.registerCommand('auth.signout', async () => {
-			credentialStore.logout();
-		}),
-	);
-
 	context.subscriptions.push(
 		vscode.commands.registerCommand(
 			'pr.openPullRequestOnGitHub',
@@ -174,7 +172,7 @@ export function registerCommands(
 
 				const diff = await folderManager.repository.diff(true);
 
-				let suggestEditMessage = '';
+				let suggestEditMessage = 'Suggested edit:\n';
 				if (e && e.inputBox && e.inputBox.value) {
 					suggestEditMessage = `${e.inputBox.value}\n`;
 					e.inputBox.value = '';
@@ -187,18 +185,19 @@ export function registerCommands(
 				await vscode.commands.executeCommand('git.unstageAll');
 
 				const tempFilePath = pathLib.join(
-					folderManager.repository.rootUri.path,
+					folderManager.repository.rootUri.fsPath,
 					'.git',
 					`${folderManager.activePullRequest.number}.diff`,
 				);
 				const encoder = new TextEncoder();
-				const tempUri = vscode.Uri.parse(tempFilePath);
+				const tempUri = vscode.Uri.file(tempFilePath);
 
 				await vscode.workspace.fs.writeFile(tempUri, encoder.encode(diff));
 				await folderManager.repository.apply(tempFilePath, true);
 				await vscode.workspace.fs.delete(tempUri);
 			} catch (err) {
-				Logger.appendLine(`Applying patch failed: ${err}`);
+				const moreError = `${err}${err.stderr ? `\n${err.stderr}` : ''}`;
+				Logger.appendLine(`Applying patch failed: ${moreError}`);
 				vscode.window.showErrorMessage(`Applying patch failed: ${formatError(err)}`);
 			}
 		}),
@@ -215,7 +214,9 @@ export function registerCommands(
 					return;
 				}
 			}
-			return vscode.commands.executeCommand('vscode.open', vscode.Uri.parse(e.blobUrl));
+			if (e.blobUrl) {
+				return vscode.commands.executeCommand('vscode.open', vscode.Uri.parse(e.blobUrl));
+			}
 		}),
 	);
 
@@ -664,7 +665,8 @@ export function registerCommands(
 			const handler = resolveCommentHandler(reply.thread);
 
 			if (handler) {
-				await handler.resolveReviewThread(reply.thread, reply.text);
+				// Hack. We need to get the original gitHubThreadId back.
+				await handler.resolveReviewThread(reply.thread.value, reply.text);
 			}
 		}),
 	);
@@ -678,7 +680,8 @@ export function registerCommands(
 			const handler = resolveCommentHandler(reply.thread);
 
 			if (handler) {
-				await handler.unresolveReviewThread(reply.thread, reply.text);
+				// Hack. We need to get the original gitHubThreadId back.
+				await handler.unresolveReviewThread(reply.thread.value, reply.text);
 			}
 		}),
 	);
@@ -718,6 +721,16 @@ export function registerCommands(
 		*/
 			telemetry.sendTelemetryEvent('pr.editComment');
 			comment.startEdit();
+		}),
+	);
+
+	context.subscriptions.push(
+	vscode.commands.registerCommand('pr.editQuery', (query: CategoryTreeNode) => {
+			/* __GDPR__
+			"pr.editQuery" : {}
+		*/
+			telemetry.sendTelemetryEvent('pr.editQuery');
+			return query.editQuery();
 		}),
 	);
 
@@ -824,4 +837,49 @@ export function registerCommands(
 			}
 		}),
 	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand('pr.expandAllComments', () => {
+			sessionState.commentsExpandState = true;
+		}));
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand('pr.collapseAllComments', () => {
+			sessionState.commentsExpandState = false;
+		}));
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand('pr.checkoutByNumber', async () => {
+
+			const githubRepositories: { manager: FolderRepositoryManager, repo: GitHubRepository }[] = [];
+			reposManager.folderManagers.forEach(manager => {
+				githubRepositories.push(...(manager.gitHubRepositories.map(repo => { return { manager, repo }; })));
+			});
+			const githubRepo = await chooseItem<{ manager: FolderRepositoryManager, repo: GitHubRepository }>(
+				githubRepositories,
+				itemValue => `${itemValue.repo.remote.owner}/${itemValue.repo.remote.repositoryName}`,
+				{ placeHolder: 'Which GitHub repository do you want to checkout the pull request from?' }
+			);
+			if (!githubRepo) {
+				return;
+			}
+			const prNumberMatcher = /^#?(\d*)$/;
+			const prNumber = await vscode.window.showInputBox({
+				ignoreFocusOut: true, prompt: 'Enter the a pull request number',
+				validateInput: (input: string) => {
+					const matches = input.match(prNumberMatcher);
+					if (!matches || (matches.length !== 2) || Number.isNaN(Number(matches[1]))) {
+						return 'Value must be a number';
+					}
+					return undefined;
+				}
+			});
+			if ((prNumber === undefined) || prNumber === '#') {
+				return;
+			}
+			const prModel = await githubRepo.manager.fetchById(githubRepo.repo, Number(prNumber.match(prNumberMatcher)![1]));
+			if (prModel) {
+				return ReviewManager.getReviewManagerForFolderManager(reviewManagers, githubRepo.manager)?.switch(prModel);
+			}
+		}));
 }

@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as vscode from 'vscode';
-import { openPullRequestOnGitHub } from '../commands';
+import { onDidUpdatePR, openPullRequestOnGitHub } from '../commands';
 import { IComment } from '../common/comment';
 import { ReviewEvent as CommonReviewEvent } from '../common/timelineEvent';
 import { formatError } from '../common/utils';
@@ -17,15 +17,32 @@ import { isInCodespaces, parseReviewers } from './utils';
 
 export class PullRequestViewProvider extends WebviewViewBase implements vscode.WebviewViewProvider {
 	public readonly viewType = 'github:activePullRequest';
-
 	private _existingReviewers: ReviewState[] = [];
+	private _prChangeListener: vscode.Disposable | undefined;
 
 	constructor(
-		private readonly _extensionUri: vscode.Uri,
+		extensionUri: vscode.Uri,
 		private readonly _folderRepositoryManager: FolderRepositoryManager,
 		private _item: PullRequestModel,
 	) {
-		super();
+		super(extensionUri);
+
+		this.registerFolderRepositoryListener();
+
+		onDidUpdatePR(
+			pr => {
+				if (pr) {
+					this._item.update(pr);
+				}
+
+				this._postMessage({
+					command: 'update-state',
+					state: this._item.state,
+				});
+			},
+			null,
+			this._disposables,
+		);
 
 		this._disposables.push(this._folderRepositoryManager.onDidMergePullRequest(_ => {
 			this._postMessage({
@@ -35,22 +52,24 @@ export class PullRequestViewProvider extends WebviewViewBase implements vscode.W
 		}));
 	}
 
+	private registerFolderRepositoryListener() {
+		this._disposables.push(this._folderRepositoryManager.onDidChangeActivePullRequest(_ => {
+			if (this._folderRepositoryManager && this._item) {
+				const isCurrentlyCheckedOut = this._item.equals(this._folderRepositoryManager.activePullRequest);
+				this._postMessage({
+					command: 'pr.update-checkout-status',
+					isCurrentlyCheckedOut,
+				});
+			}
+		}));
+	}
+
 	public resolveWebviewView(
 		webviewView: vscode.WebviewView,
 		_context: vscode.WebviewViewResolveContext,
 		_token: vscode.CancellationToken,
 	) {
-		this._view = webviewView;
-		this._webview = webviewView.webview;
-		super.initialize();
-
-		webviewView.webview.options = {
-			// Allow scripts in the webview
-			enableScripts: true,
-
-			localResourceRoots: [this._extensionUri],
-		};
-
+		super.resolveWebviewView(webviewView, _context, _token);
 		webviewView.webview.html = this._getHtmlForWebview();
 
 		this.updatePullRequest(this._item);
@@ -104,6 +123,10 @@ export class PullRequestViewProvider extends WebviewViewBase implements vscode.W
 	}
 
 	public async updatePullRequest(pullRequestModel: PullRequestModel): Promise<void> {
+		if (!this._prChangeListener || (pullRequestModel.number !== this._item.number)) {
+			this._prChangeListener?.dispose();
+			this._prChangeListener = pullRequestModel.onDidInvalidate(() => this.updatePullRequest(pullRequestModel));
+		}
 		return Promise.all([
 			this._folderRepositoryManager.resolvePullRequest(
 				pullRequestModel.remote.owner,
@@ -113,21 +136,22 @@ export class PullRequestViewProvider extends WebviewViewBase implements vscode.W
 			this._folderRepositoryManager.getPullRequestRepositoryAccessAndMergeMethods(pullRequestModel),
 			pullRequestModel.getTimelineEvents(),
 			pullRequestModel.getReviewRequests(),
+			this._folderRepositoryManager.getBranchNameForPullRequest(pullRequestModel),
 		])
 			.then(result => {
-				const [pullRequest, repositoryAccess, timelineEvents, requestedReviewers] = result;
+				const [pullRequest, repositoryAccess, timelineEvents, requestedReviewers, branchInfo] = result;
 				if (!pullRequest) {
 					throw new Error(
 						`Fail to resolve Pull Request #${pullRequestModel.number} in ${pullRequestModel.remote.owner}/${pullRequestModel.remote.repositoryName}`,
 					);
 				}
 
+				this._item = pullRequest;
 				if (!this._view) {
 					// If the there is no PR webview, then there is nothing else to update.
 					return;
 				}
 
-				this._item = pullRequest;
 				this._view.title = `${pullRequest.title} #${pullRequestModel.number.toString()}`;
 
 				const isCurrentlyCheckedOut = pullRequestModel.equals(this._folderRepositoryManager.activePullRequest);
@@ -170,8 +194,11 @@ export class PullRequestViewProvider extends WebviewViewBase implements vscode.W
 						},
 						state: pullRequest.state,
 						isCurrentlyCheckedOut: isCurrentlyCheckedOut,
-						base: pullRequest.base?.label ?? 'UNKNOWN',
-						head: pullRequest.head?.label ?? 'UNKNOWN',
+						isRemoteBaseDeleted: pullRequest.isRemoteBaseDeleted,
+						base: pullRequest.base.label,
+						isRemoteHeadDeleted: pullRequest.isRemoteHeadDeleted,
+						isLocalHeadDeleted: !branchInfo,
+						head: pullRequest.head?.label ?? '',
 						canEdit: canEdit,
 						hasWritePermission,
 						mergeable: pullRequest.item.mergeable,
@@ -342,6 +369,8 @@ export class PullRequestViewProvider extends WebviewViewBase implements vscode.W
 			ignoreFocusOut: true,
 		});
 
+		const deletedBranchTypes: string[] = [];
+
 		if (selectedActions) {
 			const isBranchActive = this._item.equals(this._folderRepositoryManager.activePullRequest);
 
@@ -349,6 +378,7 @@ export class PullRequestViewProvider extends WebviewViewBase implements vscode.W
 				switch (action.type) {
 					case 'upstream':
 						await this._folderRepositoryManager.deleteBranch(this._item);
+						deletedBranchTypes.push(action.type);
 						return this._folderRepositoryManager.repository.fetch({ prune: true });
 					case 'local':
 						if (isBranchActive) {
@@ -369,11 +399,14 @@ export class PullRequestViewProvider extends WebviewViewBase implements vscode.W
 							);
 							await this._folderRepositoryManager.repository.checkout(defaultBranch);
 						}
-						return this._folderRepositoryManager.repository.deleteBranch(branchInfo!.branch, true);
+						await this._folderRepositoryManager.repository.deleteBranch(branchInfo!.branch, true);
+						return deletedBranchTypes.push(action.type);
 					case 'remote':
-						return this._folderRepositoryManager.repository.removeRemote(branchInfo!.remote!);
+						await this._folderRepositoryManager.repository.removeRemote(branchInfo!.remote!);
+						return deletedBranchTypes.push(action.type);
 					case 'suspend':
-						return vscode.commands.executeCommand('github.codespaces.disconnectSuspend');
+						await vscode.commands.executeCommand('github.codespaces.disconnectSuspend');
+						return deletedBranchTypes.push(action.type);
 				}
 			});
 
@@ -383,6 +416,7 @@ export class PullRequestViewProvider extends WebviewViewBase implements vscode.W
 
 			this._postMessage({
 				command: 'pr.deleteBranch',
+				branchTypes: deletedBranchTypes
 			});
 		} else {
 			this._replyMessage(message, {

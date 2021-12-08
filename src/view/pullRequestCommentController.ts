@@ -8,6 +8,8 @@ import { v4 as uuid } from 'uuid';
 import * as vscode from 'vscode';
 import { CommentHandler, registerCommentHandler, unregisterCommentHandler } from '../commentHandlerResolver';
 import { DiffSide, IComment } from '../common/comment';
+import Logger from '../common/logger';
+import { ISessionState } from '../common/sessionState';
 import { fromPRUri } from '../common/uri';
 import { groupBy } from '../common/utils';
 import { FolderRepositoryManager } from '../github/folderRepositoryManager';
@@ -33,6 +35,7 @@ export class PullRequestCommentController implements CommentHandler, CommentReac
 		private pullRequestModel: PullRequestModel,
 		private _folderReposManager: FolderRepositoryManager,
 		private _commentController: vscode.CommentController,
+		private readonly _sessionState: ISessionState
 	) {
 		this._commentHandlerId = uuid();
 		registerCommentHandler(this._commentHandlerId, this);
@@ -65,6 +68,23 @@ export class PullRequestCommentController implements CommentHandler, CommentReac
 				this.refreshContextKey(e);
 			}),
 		);
+
+		this._disposables.push(
+			this._sessionState.onDidChangeCommentsExpandState(expand => {
+				for (const reviewThread of this.pullRequestModel.reviewThreadsCache) {
+					const key = this.getCommentThreadCacheKey(reviewThread.path, reviewThread.diffSide === DiffSide.LEFT);
+					const cachedThread = this._commentThreadCache[key];
+					if (!cachedThread) {
+						Logger.appendLine(`PullRequestCommentController> Thread with ID ${key} is no longer in cache`);
+						continue;
+					}
+					const index = cachedThread.findIndex(t => t.gitHubThreadId === reviewThread.id);
+					if (index > -1) {
+						const matchingThread = cachedThread[index];
+						updateThread(matchingThread, reviewThread, expand);
+					}
+				}
+			}));
 	}
 
 	private refreshContextKey(editor: vscode.TextEditor | undefined): void {
@@ -109,7 +129,7 @@ export class PullRequestCommentController implements CommentHandler, CommentReac
 		const reviewThreads = this.pullRequestModel.reviewThreadsCache;
 		const threadsByPath = groupBy(reviewThreads, thread => thread.path);
 		editors.forEach(editor => {
-			const { fileName, isBase } = fromPRUri(editor.document.uri);
+			const { fileName, isBase } = fromPRUri(editor.document.uri)!;
 			if (threadsByPath[fileName]) {
 				this._commentThreadCache[this.getCommentThreadCacheKey(fileName, isBase)] = threadsByPath[fileName]
 					.filter(
@@ -147,7 +167,7 @@ export class PullRequestCommentController implements CommentHandler, CommentReac
 		this._openPREditors = prEditors;
 
 		removed.forEach(editor => {
-			const { fileName, isBase } = fromPRUri(editor.document.uri);
+			const { fileName, isBase } = fromPRUri(editor.document.uri)!;
 			const key = this.getCommentThreadCacheKey(fileName, isBase);
 			const threads = this._commentThreadCache[key] || [];
 			threads.forEach(t => t.dispose());
@@ -168,20 +188,20 @@ export class PullRequestCommentController implements CommentHandler, CommentReac
 				return samePath && sameLine;
 			});
 
-			let newThread: GHPRCommentThread;
+			let newThread: GHPRCommentThread | undefined = undefined;
 			if (index > -1) {
 				newThread = this._pendingCommentThreadAdds[index];
-				newThread.threadId = thread.id;
-				newThread.comments = thread.comments.map(c => new GHPRComment(c, newThread));
+				newThread.gitHubThreadId = thread.id;
+				newThread.comments = thread.comments.map(c => new GHPRComment(c, newThread!));
 				this._pendingCommentThreadAdds.splice(index, 1);
 			} else {
 				const openPREditors = this.getPREditors(vscode.window.visibleTextEditors);
 				const matchingEditor = openPREditors.find(editor => {
 					const query = fromPRUri(editor.document.uri);
 					const sameSide =
-						(thread.diffSide === DiffSide.RIGHT && !query.isBase) ||
-						(thread.diffSide === DiffSide.LEFT && query.isBase);
-					return query.fileName === fileName && sameSide;
+						(thread.diffSide === DiffSide.RIGHT && !query?.isBase) ||
+						(thread.diffSide === DiffSide.LEFT && query?.isBase);
+					return query?.fileName === fileName && sameSide;
 				});
 
 				if (matchingEditor) {
@@ -199,6 +219,9 @@ export class PullRequestCommentController implements CommentHandler, CommentReac
 				}
 			}
 
+			if (!newThread) {
+				return;
+			}
 			const key = this.getCommentThreadCacheKey(thread.path, thread.diffSide === DiffSide.LEFT);
 			if (this._commentThreadCache[key]) {
 				this._commentThreadCache[key].push(newThread);
@@ -209,7 +232,7 @@ export class PullRequestCommentController implements CommentHandler, CommentReac
 
 		e.changed.forEach(thread => {
 			const key = this.getCommentThreadCacheKey(thread.path, thread.diffSide === DiffSide.LEFT);
-			const index = this._commentThreadCache[key].findIndex(t => t.threadId === thread.id);
+			const index = this._commentThreadCache[key].findIndex(t => t.gitHubThreadId === thread.id);
 			if (index > -1) {
 				const matchingThread = this._commentThreadCache[key][index];
 				updateThread(matchingThread, thread);
@@ -218,7 +241,7 @@ export class PullRequestCommentController implements CommentHandler, CommentReac
 
 		e.removed.forEach(async thread => {
 			const key = this.getCommentThreadCacheKey(thread.path, thread.diffSide === DiffSide.LEFT);
-			const index = this._commentThreadCache[key].findIndex(t => t.threadId === thread.id);
+			const index = this._commentThreadCache[key].findIndex(t => t.gitHubThreadId === thread.id);
 			if (index > -1) {
 				const matchingThread = this._commentThreadCache[key][index];
 				this._commentThreadCache[key].splice(index, 1);
@@ -243,7 +266,7 @@ export class PullRequestCommentController implements CommentHandler, CommentReac
 
 	private getCommentSide(thread: GHPRCommentThread): DiffSide {
 		const query = fromPRUri(thread.uri);
-		return query.isBase ? DiffSide.LEFT : DiffSide.RIGHT;
+		return query?.isBase ? DiffSide.LEFT : DiffSide.RIGHT;
 	}
 
 	public async createOrReplyComment(
@@ -280,8 +303,15 @@ export class PullRequestCommentController implements CommentHandler, CommentReac
 				await this.pullRequestModel.submitReview();
 			}
 		} catch (e) {
-			vscode.window.showErrorMessage(`Creating comment failed: ${e}`);
-
+			if (e.graphQLErrors?.length && e.graphQLErrors[0].type === 'NOT_FOUND') {
+				vscode.window.showWarningMessage('The comment that you\'re replying to was deleted. Refresh to update.', 'Refresh').then(result => {
+					if (result === 'Refresh') {
+						this.pullRequestModel.invalidate();
+					}
+				});
+			} else {
+				vscode.window.showErrorMessage(`Creating comment failed: ${e}`);
+			}
 			thread.comments = thread.comments.map(c => {
 				if (c instanceof TemporaryComment && c.id === temporaryCommentId) {
 					c.mode = vscode.CommentMode.Editing;
@@ -368,10 +398,11 @@ export class PullRequestCommentController implements CommentHandler, CommentReac
 
 	// #region Review
 	public async startReview(thread: GHPRCommentThread, input: string): Promise<void> {
+		const hasExistingComments = thread.comments.length;
 		const temporaryCommentId = this.optimisticallyAddComment(thread, input, true);
 
 		try {
-			if (!thread.comments.length) {
+			if (!hasExistingComments) {
 				const fileName = this.gitRelativeRootPath(thread.uri.path);
 				const side = this.getCommentSide(thread);
 				this._pendingCommentThreadAdds.push(thread);
@@ -428,7 +459,7 @@ export class PullRequestCommentController implements CommentHandler, CommentReac
 				await this.createCommentOnResolve(thread, input);
 			}
 
-			await this.pullRequestModel.resolveReviewThread(thread.threadId);
+			await this.pullRequestModel.resolveReviewThread(thread.gitHubThreadId);
 		} catch (e) {
 			vscode.window.showErrorMessage(`Resolving conversation failed: ${e}`);
 		}
@@ -440,7 +471,7 @@ export class PullRequestCommentController implements CommentHandler, CommentReac
 				await this.createCommentOnResolve(thread, input);
 			}
 
-			await this.pullRequestModel.unresolveReviewThread(thread.threadId);
+			await this.pullRequestModel.unresolveReviewThread(thread.gitHubThreadId);
 		} catch (e) {
 			vscode.window.showErrorMessage(`Unresolving conversation failed: ${e}`);
 		}

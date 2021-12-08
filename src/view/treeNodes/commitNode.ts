@@ -26,6 +26,7 @@ export class CommitNode extends TreeNode implements vscode.TreeItem {
 		private readonly pullRequest: PullRequestModel,
 		private readonly commit: OctokitCommon.PullsListCommitsResponseItem,
 		private readonly comments: IComment[],
+		private readonly isCurrent: boolean
 	) {
 		super();
 		this.label = commit.commit.message;
@@ -49,19 +50,19 @@ export class CommitNode extends TreeNode implements vscode.TreeItem {
 	}
 
 	async getChildren(): Promise<TreeNode[]> {
-		const fileChanges = await this.pullRequest.getCommitChangedFiles(this.commit);
+		const fileChanges = (await this.pullRequest.getCommitChangedFiles(this.commit)) ?? [];
 
 		const fileChangeNodes = fileChanges.map(change => {
 			const matchingComments = this.comments.filter(
 				comment => comment.path === change.filename && comment.originalCommitId === this.commit.sha,
 			);
-			const fileName = change.filename;
-			const uri = vscode.Uri.parse(path.join(`commit~${this.commit.sha.substr(0, 8)}`, fileName));
+			const fileName = change.filename!;
+			const uri = vscode.Uri.parse(path.posix.join(`commit~${this.commit.sha.substr(0, 8)}`, fileName));
 			const fileChangeNode = new GitFileChangeNode(
 				this,
 				this.pullRequestManager,
 				this.pullRequest,
-				getGitChangeType(change.status),
+				getGitChangeType(change.status!),
 				fileName,
 				undefined,
 				toReviewUri(
@@ -85,6 +86,7 @@ export class CommitNode extends TreeNode implements vscode.TreeItem {
 				[],
 				matchingComments,
 				this.commit.sha,
+				this.isCurrent
 			);
 
 			fileChangeNode.useViewChangesCommand();

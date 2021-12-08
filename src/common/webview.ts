@@ -45,13 +45,16 @@ export class WebviewBase {
 	}
 
 	public initialize(): void {
-		this._disposables.push(this._webview?.onDidReceiveMessage(
+		const disposable = this._webview?.onDidReceiveMessage(
 			async message => {
 				await this._onDidReceiveMessage(message);
 			},
 			null,
 			this._disposables,
-		));
+		);
+		if (disposable) {
+			this._disposables.push(disposable);
+		}
 	}
 
 	protected async _onDidReceiveMessage(message: IRequestMessage<any>): Promise<any> {
@@ -97,6 +100,30 @@ export class WebviewBase {
 export class WebviewViewBase extends WebviewBase {
 	public readonly viewType: string;
 	protected _view?: vscode.WebviewView;
+
+	constructor(
+		protected readonly _extensionUri: vscode.Uri) {
+		super();
+	}
+
+	protected resolveWebviewView(
+		webviewView: vscode.WebviewView,
+		_context: vscode.WebviewViewResolveContext,
+		_token: vscode.CancellationToken) {
+		this._view = webviewView;
+		this._webview = webviewView.webview;
+		super.initialize();
+		webviewView.webview.options = {
+			// Allow scripts in the webview
+			enableScripts: true,
+
+			localResourceRoots: [this._extensionUri],
+		};
+		this._disposables.push(this._view.onDidDispose(() => {
+			this._webview = undefined;
+			this._view = undefined;
+		}));
+	}
 
 	public show() {
 		if (this._view) {

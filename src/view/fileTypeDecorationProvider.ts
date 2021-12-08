@@ -6,6 +6,7 @@
 import * as vscode from 'vscode';
 import { GitChangeType } from '../common/file';
 import { fromFileChangeNodeUri, fromPRUri } from '../common/uri';
+import { GITHUB_FILE_SCHEME } from './compareChangesTreeDataProvider';
 
 export class FileTypeDecorationProvider implements vscode.FileDecorationProvider {
 	private _disposables: vscode.Disposable[];
@@ -19,7 +20,7 @@ export class FileTypeDecorationProvider implements vscode.FileDecorationProvider
 		uri: vscode.Uri,
 		_token: vscode.CancellationToken,
 	): vscode.ProviderResult<vscode.FileDecoration> {
-		if (uri.scheme !== 'filechange' && uri.scheme !== 'github') {
+		if (uri.scheme !== 'filechange' && uri.scheme !== GITHUB_FILE_SCHEME) {
 			return;
 		}
 
@@ -28,6 +29,7 @@ export class FileTypeDecorationProvider implements vscode.FileDecorationProvider
 			return {
 				propagate: false,
 				badge: this.letter(fileChangeUriParams.status),
+				color: this.color(fileChangeUriParams.status)
 			};
 		}
 
@@ -37,10 +39,36 @@ export class FileTypeDecorationProvider implements vscode.FileDecorationProvider
 			return {
 				propagate: false,
 				badge: this.letter(prParams.status),
+				color: this.color(prParams.status)
 			};
 		}
 
 		return undefined;
+	}
+
+	color(status: GitChangeType): vscode.ThemeColor | undefined {
+		let color: string | undefined;
+		switch (status) {
+			case GitChangeType.MODIFY:
+				color = 'gitDecoration.modifiedResourceForeground';
+				break;
+			case GitChangeType.ADD:
+				color = 'gitDecoration.addedResourceForeground';
+				break;
+			case GitChangeType.DELETE:
+				color = 'gitDecoration.deletedResourceForeground';
+				break;
+			case GitChangeType.RENAME:
+				color = 'gitDecoration.renamedResourceForeground';
+				break;
+			case GitChangeType.UNKNOWN:
+				color = undefined;
+				break;
+			case GitChangeType.UNMERGED:
+				color = 'gitDecoration.conflictingResourceForeground';
+				break;
+		}
+		return color ? new vscode.ThemeColor(color) : undefined;
 	}
 
 	letter(status: GitChangeType): string {

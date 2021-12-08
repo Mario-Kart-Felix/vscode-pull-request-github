@@ -10,6 +10,7 @@ import { PullRequest, ReviewType } from '../common/cache';
 import PullRequestContext from '../common/context';
 import emitter from '../common/events';
 import { useStateProp } from '../common/hooks';
+import { escapeMarkdownSyntaxTokens } from '../common/markdown';
 import { Dropdown } from './dropdown';
 import { commentIcon, deleteIcon, editIcon } from './icon';
 import { nbsp, Spaced } from './space';
@@ -34,7 +35,7 @@ export function CommentView(comment: Props) {
 		return React.cloneElement(comment.headerInEditMode ? <CommentBox for={comment} /> : <></>, {}, [
 			<EditComment
 				id={id}
-				body={currentDraft || bodyMd}
+				body={currentDraft || escapeMarkdownSyntaxTokens(bodyMd)}
 				onCancel={() => {
 					if (pr.pendingCommentDrafts) {
 						delete pr.pendingCommentDrafts[id];
@@ -238,14 +239,16 @@ export function AddComment({
 	isIssue,
 	isAuthor,
 	continueOnGitHub,
+	currentUserReviewState
 }: PullRequest) {
 	const { updatePR, comment, requestChanges, approve, close, openOnGitHub } = useContext(PullRequestContext);
 	const [isBusy, setBusy] = useState(false);
 	const form = useRef<HTMLFormElement>();
 	const textareaRef = useRef<HTMLTextAreaElement>();
 
-	emitter.addListener('quoteReply', message => {
-		updatePR({ pendingCommentText: `> ${message} \n\n` });
+	emitter.addListener('quoteReply', (message: string) => {
+		const quoted = message.replace(/\n\n/g, '\n\n> ');
+		updatePR({ pendingCommentText: `> ${quoted} \n\n` });
 		textareaRef.current.scrollIntoView();
 		textareaRef.current.focus();
 	});
@@ -332,7 +335,7 @@ export function AddComment({
 					<button
 						id="approve"
 						className="secondary"
-						disabled={isBusy}
+						disabled={isBusy || currentUserReviewState === 'APPROVED'}
 						onClick={onClick}
 						data-command="approve"
 					>
@@ -352,9 +355,9 @@ export function AddComment({
 }
 
 const COMMENT_METHODS = {
-	comment: 'Comment',
-	approve: 'Approve',
-	requestChanges: 'Request Changes',
+	comment: 'Comment and Submit',
+	approve: 'Approve and Submit',
+	requestChanges: 'Request Changes and Submit',
 };
 
 export const AddCommentSimple = (pr: PullRequest) => {

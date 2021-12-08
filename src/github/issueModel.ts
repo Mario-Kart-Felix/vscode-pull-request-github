@@ -38,6 +38,9 @@ export class IssueModel<TItem extends Issue = Issue> {
 	public item: TItem;
 	public bodyHTML?: string;
 
+	private _onDidInvalidate = new vscode.EventEmitter<void>();
+	public onDidInvalidate = this._onDidInvalidate.event;
+
 	constructor(githubRepository: GitHubRepository, remote: Remote, item: TItem, skipUpdate: boolean = false) {
 		this.githubRepository = githubRepository;
 		this.remote = remote;
@@ -48,8 +51,17 @@ export class IssueModel<TItem extends Issue = Issue> {
 		}
 	}
 
+	public invalidate() {
+		// Something about the PR data is stale
+		this._onDidInvalidate.fire();
+	}
+
 	public get isOpen(): boolean {
 		return this.state === GithubItemStateEnum.Open;
+	}
+
+	public get isClosed(): boolean {
+		return this.state === GithubItemStateEnum.Closed;
 	}
 
 	public get userAvatar(): string | undefined {
@@ -145,7 +157,12 @@ export class IssueModel<TItem extends Issue = Issue> {
 					},
 				},
 			});
-
+			if (data?.updatePullRequest.pullRequest) {
+				this.item.body = data.updatePullRequest.pullRequest.body;
+				this.bodyHTML = data.updatePullRequest.pullRequest.bodyHTML;
+				this.title = data.updatePullRequest.pullRequest.title;
+				this.invalidate();
+			}
 			return data!.updatePullRequest.pullRequest;
 		} catch (e) {
 			throw new Error(formatError(e));

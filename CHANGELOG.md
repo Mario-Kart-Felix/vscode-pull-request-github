@@ -1,5 +1,210 @@
 # Changelog
 
+## 0.34.0
+
+### Changes
+
+- This extension now supports pre-releases using VS Code's built in pre-release feature. Version 0.33.0 was skipped to support this.
+
+![Extension pre-release support](documentation/changelog/0.34.0/pre-release-extension.png)
+
+- Support for opening a pull request by number.
+- The default issue query now includes recent issues to help with issue completions.
+- Create PR button no longer shows if there is already a PR.
+- Git file status colors are now used for PR files.
+
+![Git change colors for PR files](documentation/changelog/0.34.0/git-change-colors.png)
+
+### Fixes
+
+- Fails to load pull requests when using ssh.github.com for ssh over https. https://github.com/microsoft/vscode-pull-request-github/issues/3052
+- vscode.dev/github.dev: Support .github/pull_request_template.md when creating a PR within vscode. https://github.com/microsoft/vscode-pull-request-github/issues/3055
+- quote reply doesn't handle nested replies. https://github.com/microsoft/vscode-pull-request-github/issues/3059
+- Don't show hover cards for @-mentioned users when related to JSDoc. https://github.com/microsoft/vscode-pull-request-github/issues/2498
+- Edit PR title, does not (auto) update title of PR in treeview (PR in list on left side). https://github.com/microsoft/vscode-pull-request-github/issues/2299
+
+**_Thank You_**
+
+* [@38elements (38elements)](https://github.com/38elements)
+  * Fix typo [PR #3049](https://github.com/microsoft/vscode-pull-request-github/pull/3049)
+  * justSwitchedToRevieMode -> justSwitchedToReviewMode [PR #3060](https://github.com/microsoft/vscode-pull-request-github/pull/3060)
+* [@burkeholland (Burke Holland)](https://github.com/burkeholland): Opening a gist repository gives a fetch error [PR #2933](https://github.com/microsoft/vscode-pull-request-github/pull/2933)
+* [@emtei (Mateusz Stopka)](https://github.com/emtei): Do not activate review mode for closed or merged PR [PR #3021](https://github.com/microsoft/vscode-pull-request-github/pull/3021)
+* [@taisph (Tais P. Hansen)](https://github.com/taisph): Fix generated branch name requiring quotes in bash [PR #3084](https://github.com/microsoft/vscode-pull-request-github/pull/3084)
+
+## 0.33.*
+
+- **This is a pre-release version** that uses VS Code's built-in pre-release extension support. The old nightly build (GitHub Pull Requests Nightly) is being deprecated in favor of the this built-in support. Users of the the old nightly build will be automatically upgraded to the new pre-release version; however, extension state will not be migrated. Thank you for helping make GitHub Pull Requests and Issues better!
+
+## 0.32.0
+
+### Changes
+
+- Action to navigate directly to pull request query in settings.json
+
+![Navigate to pull request query](documentation/changelog/0.32.0/navigate-pr-query.gif)
+
+### Fixes
+
+- Cannot set branch tile when starting working on an issue despite useBranchForIssues=prompt. https://github.com/microsoft/vscode-pull-request-github/issues/3032
+- No issue hovers in code editor. https://github.com/microsoft/vscode-pull-request-github/issues/3013
+- Pending checks section is empty. https://github.com/microsoft/vscode-pull-request-github/issues/2949
+
+**_Thank You_**
+
+* [@burkeholland (Burke Holland)](https://github.com/burkeholland)
+  * Fixes Commit hash should use a monospace font #2957 [PR #2968](https://github.com/microsoft/vscode-pull-request-github/pull/2968)
+  * Burkeholland-issue1635 [PR #2993](https://github.com/microsoft/vscode-pull-request-github/pull/2993)
+  * Title doesn't have enough horizontal space in small tabs [PR #3029](https://github.com/microsoft/vscode-pull-request-github/pull/3029)
+  * Fix 2959 - Merge title box needs top margin [PR #3039](https://github.com/microsoft/vscode-pull-request-github/pull/3039)
+* [@nicholas-l (Nicholas Latham)](https://github.com/nicholas-l): Allow authentication for github enterprise [PR #3064](https://github.com/microsoft/vscode-pull-request-github/pull/3064)
+
+## 0.31.1
+
+### Fixes
+
+- Don't ask for auth upon activation. https://github.com/microsoft/vscode-pull-request-github/issues/3044
+
+## 0.31.0
+
+### Changes
+
+- Variable in settings for lowercase branch names when working on and issue
+```json
+{
+  "githubIssues.issueBranchTitle": "${sanitizedLowercaseIssueTitle}"
+}
+```
+
+### Fixes
+- issueBranchTitle not Working as Expected. https://github.com/microsoft/vscode-pull-request-github/issues/2259
+- Skipped status check is shown as pending. https://github.com/microsoft/vscode-pull-request-github/issues/2580
+
+**_Thank You_**
+
+- fix: make pending checks "show" button / link accessible. [2972](https://github.com/microsoft/vscode-pull-request-github/pull/2972) by @moshfeu
+- Fixes Tick SVG doesn't look right #2950. [2971](https://github.com/microsoft/vscode-pull-request-github/pull/2971) by @burkeholland
+- Create commit select horizontal padding is too high. [2970](https://github.com/microsoft/vscode-pull-request-github/pull/2970) by @burkeholland
+- Focus border is used on assignees when it's not focused. [2967](https://github.com/microsoft/vscode-pull-request-github/pull/2967) by @burkeholland
+- Button sizes don't look right when PR title is wrapped. [2966](https://github.com/microsoft/vscode-pull-request-github/pull/2966) by @burkeholland
+- Respect remote link type for upstream. [2929](https://github.com/microsoft/vscode-pull-request-github/pull/2929) by @burkeholland
+- Fixes #2259. [2909](https://github.com/microsoft/vscode-pull-request-github/pull/2909) by @burkeholland
+- Lowercase branch names. [2986](https://github.com/microsoft/vscode-pull-request-github/pull/2986) by @burkeholland
+- GitHub permalinks: Deduplicate the line number if the range is one line. [2980](https://github.com/microsoft/vscode-pull-request-github/pull/2980) by @lgarron
+- Skipped status check is shown as pending. [3005](https://github.com/microsoft/vscode-pull-request-github/pull/3005) by @burkeholland
+- PR created x minutes ago is cut off in small tabs. [2985](https://github.com/microsoft/vscode-pull-request-github/pull/2985) by @burkeholland
+
+## 0.30.0
+
+### Changes
+
+- All comments can be collapsed using the UI.
+
+![Collapse all comments UI button](documentation/changelog/0.30.0/comments-collapse-all.png)
+- All comments can be expanded and collapsed via the commands **GitHub Pull Requests: Expand All Comments** and **GitHub Pull Requests: Collapse All Comments**.
+- The expand/collapse state of pull request comments can be set with the setting `githubPullRequests.commentExpandState`.
+- Adopted the new multiling string support for settings.
+
+![Multiline setting](documentation/changelog/0.30.0/multiline-setting.png)
+- Improved the language on the sidebar view to better indicate that you can submit a review.
+
+### Fixes
+
+- Copy GitHub Permalink is missing line info. https://github.com/microsoft/vscode-pull-request-github/issues/2924
+- Old image version is not shown when viewing a checked-out pull request change for an image. https://github.com/microsoft/vscode-pull-request-github/issues/2914
+- Extension asks to create pull request when remote is not github. https://github.com/microsoft/vscode-pull-request-github/issues/2879
+- Edits to comments on PRs not being applied. https://github.com/microsoft/vscode-pull-request-github/issues/2869
+- Could not resolve conversation on old PR. https://github.com/microsoft/vscode-pull-request-github/issues/2857
+- Issue queries have the wrong owner. https://github.com/microsoft/vscode-pull-request-github/issues/2836
+- PR description should auto fill when the PR is a single commit. https://github.com/microsoft/vscode-pull-request-github/issues/2540
+
+**_Thank You_**
+
+- Always show action bar in PR overview header. [2849](https://github.com/microsoft/vscode-pull-request-github/pull/2849) by @joshuaobrien
+- When using a branch name as a PR title, ensure the first letter is capitalized. [2848](https://github.com/microsoft/vscode-pull-request-github/pull/2848) by @joshuaobrien
+- Include PR template in PR description if there is just one commit. [2846](https://github.com/microsoft/vscode-pull-request-github/pull/2846) by @joshuaobrien
+- Let the view know about the review status of the PR. [1833](https://github.com/microsoft/vscode-pull-request-github/pull/1833) by @RishabhKothaari
+
+## 0.29.2
+
+### Fixes
+
+- Fix **Copy Permalink** commands for github.dev. https://github.com/microsoft/vscode-pull-request-github/issues/2903
+
+## 0.29.1
+
+### Fixes
+
+- Do not preload mentionable users when a PR isn't checked out. https://github.com/microsoft/vscode-pull-request-github/issues/2892
+
+## 0.29.0
+
+### Changes
+
+- "Start working" on an issue has been expanded to let you work on issues outside of the repo you currently have open.
+- Improved UX for merged PRs in the sidebar view.
+
+![Merged PR sidebar view](documentation/changelog/0.29.0/merged-pr-sidebar.png)
+
+### Fixes
+
+- Comments can be deleted from the overview path. https://github.com/microsoft/vscode-pull-request-github/issues/2855
+- Comments no longer get stuck "pending". https://github.com/microsoft/vscode-pull-request-github/issues/2822
+- Comments are visible in diffs opened from the commits file view. https://github.com/microsoft/vscode-pull-request-github/issues/2688
+- "Webview is disposed" error is fixed. https://github.com/microsoft/vscode-pull-request-github/issues/2444
+
+**_Thank You_**
+
+- Fix check fork details [#2806](https://github.com/microsoft/vscode-pull-request-github/pull/2806) by @binsee
+- chore: replace deprecated vscode-test with @vscode/test-electron [#2842](https://github.com/microsoft/vscode-pull-request-github/pull/2842) by @iChenLei
+
+## 0.28.0
+
+### Changes
+
+- Status bar entries use the new `createStatusBarItem` API to show better names.
+
+![Status bar name](documentation/changelog/0.28.0/status-bar-name.png)
+
+
+### Fixes
+
+- Placeholder avatar is shown correctly with GitHub Enterprise. https://github.com/microsoft/vscode-pull-request-github/issues/2771
+- Error messages no longer shown when there's a non-GitHub remote. https://github.com/microsoft/vscode-pull-request-github/issues/2768
+- Copying a permalink doesn't require sign in. https://github.com/microsoft/vscode-pull-request-github/issues/2761
+- There's a new timeout for listing branches so that repositories with many branches don't hang. https://github.com/microsoft/vscode-pull-request-github/issues/2753
+- "There are updates" notification is shown less often and can be permanently hidden. https://github.com/microsoft/vscode-pull-request-github/issues/2628
+- [And more!](https://github.com/microsoft/vscode-pull-request-github/issues?q=is%3Aissue+label%3Abug+milestone%3A%22June+2021%22+is%3Aclosed)
+
+**_Thank You_**
+
+- Fix broken pull request files pagination [#2766](https://github.com/microsoft/vscode-pull-request-github/pull/2766) by @habibm
+
+## 0.27.1
+
+- Fix links in the readme for the marketplace: https://github.com/microsoft/vscode-pull-request-github/issues/2769
+
+## 0.27.0
+
+- Thanks to a community PR from @kabel, there is support for GitHub Enterprise. See [the discussion in the PR](https://github.com/microsoft/vscode/pull/115940) for how to get set up.
+
+## 0.26.0
+- Files that have been marked as viewed on GitHub show a checkmark decoration in the pull request tree. Each file in the tree has an inline action for marking it as viewed or not viewed.
+
+![Hovering over a file in the pull request tree, an inline action to mark the file as viewed appears. When marked as viewed, the file is updated with a checkmark decoration and the action changes to mark as not viewed ](documentation/changelog/0.26.0/mark-as-viewed.gif)
+
+- Conversations can be marked as resolved within the editor. Resolved conversations collapse by default.
+
+-![The comment editor widget in a file. The comment thread has actions to "Resolve Conversation" and "Add Comment".](documentation/changelog/0.26.0/resolve-conversation.png)
+
+- The commented decoration in tree views has been updated to a speech bubble for clarity.
+
+-![The pull request tree, showing a file decorated with a speech bubble indicating it has been commented on.](documentation/changelog/0.26.0/file-decoration.png)
+
+- The "Delete Review" and "Finish Review" buttons have been removed from the comment widget. Instead there is a "Go to Review" button which shows all comments in the pending review and allows choosing how to submit the review, as an approval or requesting changes.
+- The "All" category of the pull request tree is expanded by default.
+- Thanks to @icatalina, there is a new `githubPullRequests.terminalLinksHandler` setting to choose how create pull request links should be handled from the terminal.
+
 ## 0.25.1
 
 ### Fixes

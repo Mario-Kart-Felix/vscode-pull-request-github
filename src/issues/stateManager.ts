@@ -5,7 +5,10 @@
 
 import LRUCache from 'lru-cache';
 import * as vscode from 'vscode';
+import { Repository } from '../api/api';
 import { GitApiImpl } from '../api/api1';
+import { parseRepositoryRemotes } from '../common/remote';
+import { AuthProvider } from '../github/credentials';
 import {
 	FolderRepositoryManager,
 	NO_MILESTONE,
@@ -141,35 +144,47 @@ export class StateManager {
 	}
 
 	private registerRepositoryChangeEvent() {
-		this.gitAPI.repositories.forEach(repository => {
-			this.context.subscriptions.push(
-				repository.state.onDidChange(async () => {
-					const state = this.getOrCreateSingleRepoState(repository.rootUri);
-					// setIssueData can cause the last head and branch state to change. Capture them before that can happen.
-					const oldHead = state.lastHead;
-					const oldBranch = state.lastBranch;
-					const newHead = repository.state.HEAD ? repository.state.HEAD.commit : undefined;
-					if ((repository.state.HEAD ? repository.state.HEAD.commit : undefined) !== oldHead) {
-						await this.setIssueData(state.folderManager);
-					}
+		async function updateRepository(that: StateManager, repository: Repository) {
+			const state = that.getOrCreateSingleRepoState(repository.rootUri);
+			// setIssueData can cause the last head and branch state to change. Capture them before that can happen.
+			const oldHead = state.lastHead;
+			const oldBranch = state.lastBranch;
+			const newHead = repository.state.HEAD ? repository.state.HEAD.commit : undefined;
+			if ((repository.state.HEAD ? repository.state.HEAD.commit : undefined) !== oldHead) {
+				await that.setIssueData(state.folderManager);
+			}
 
-					const newBranch = repository.state.HEAD?.name;
-					if (
-						(oldHead !== newHead || oldBranch !== newBranch) &&
-						(!state.currentIssue || newBranch !== state.currentIssue.branchName)
-					) {
-						if (newBranch) {
-							if (state.folderManager) {
-								await this.setCurrentIssueFromBranch(state, newBranch);
-							}
-						} else {
-							await this.setCurrentIssue(state, undefined);
-						}
+			const newBranch = repository.state.HEAD?.name;
+			if (
+				(oldHead !== newHead || oldBranch !== newBranch) &&
+				(!state.currentIssue || newBranch !== state.currentIssue.branchName)
+			) {
+				if (newBranch) {
+					if (state.folderManager) {
+						await that.setCurrentIssueFromBranch(state, newBranch);
 					}
-					state.lastHead = repository.state.HEAD ? repository.state.HEAD.commit : undefined;
-					state.lastBranch = repository.state.HEAD ? repository.state.HEAD.name : undefined;
+				} else {
+					await that.setCurrentIssue(state, undefined);
+				}
+			}
+			state.lastHead = repository.state.HEAD ? repository.state.HEAD.commit : undefined;
+			state.lastBranch = repository.state.HEAD ? repository.state.HEAD.name : undefined;
+		}
+
+		function addChangeEvent(that: StateManager, repository: Repository) {
+			that.context.subscriptions.push(
+				repository.state.onDidChange(async () => {
+					updateRepository(that, repository);
 				}),
 			);
+		}
+
+		this.context.subscriptions.push(this.gitAPI.onDidOpenRepository(repository => {
+			updateRepository(this, repository);
+			addChangeEvent(this, repository);
+		}));
+		this.gitAPI.repositories.forEach(repository => {
+			addChangeEvent(this, repository);
 		});
 	}
 
@@ -201,8 +216,8 @@ export class StateManager {
 				}
 			}),
 		);
-		await this.setAllIssueData();
 		this.registerRepositoryChangeEvent();
+		await this.setAllIssueData();
 		this.context.subscriptions.push(
 			this.onRefreshCacheNeeded(async () => {
 				await this.refresh();
@@ -261,8 +276,8 @@ export class StateManager {
 		return state.userMap;
 	}
 
-	private async getCurrentUser(): Promise<string | undefined> {
-		return this.manager.credentialStore.getCurrentUser()?.login;
+	private async getCurrentUser(authProviderId: AuthProvider): Promise<string | undefined> {
+		return this.manager.credentialStore.getCurrentUser(authProviderId)?.login;
 	}
 
 	private async setAllIssueData() {
@@ -287,7 +302,10 @@ export class StateManager {
 					}
 				}
 				if (!user) {
-					user = await this.getCurrentUser();
+					const enterpriseRemotes = parseRepositoryRemotes(folderManager.repository).filter(
+						remote => remote.authProviderId === AuthProvider['github-enterprise']
+					);
+					user = await this.getCurrentUser(enterpriseRemotes.length ? AuthProvider['github-enterprise'] : AuthProvider.github);
 				}
 				items = this.setIssues(
 					folderManager,
@@ -479,7 +497,8 @@ export class StateManager {
 			return;
 		}
 		if (shouldShowStatusBarItem && !this.statusBarItem) {
-			this.statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
+			this.statusBarItem = vscode.window.createStatusBarItem('github.issues.status', vscode.StatusBarAlignment.Left, 0);
+			this.statusBarItem.name = 'GitHub Active Issue';
 		}
 		const statusBarItem = this.statusBarItem!;
 		statusBarItem.text = `$(issues) Issue ${currentIssues
@@ -500,7 +519,7 @@ export class StateManager {
 		return state.issues[`${issueNumber}`] ?? {};
 	}
 
-	setSavedIssueState(issue: IssueModel, issueState: IssueState) {
+	async setSavedIssueState(issue: IssueModel, issueState: IssueState) {
 		const state: IssuesState = this.getSavedState();
 		state.issues[`${issue.number}`] = { ...issueState, stateModifiedTime: new Date().valueOf() };
 		if (issueState.branch) {
@@ -513,6 +532,6 @@ export class StateManager {
 				repositoryName: issue.remote.repositoryName,
 			};
 		}
-		this.context.workspaceState.update(ISSUES_KEY, JSON.stringify(state));
+		return this.context.workspaceState.update(ISSUES_KEY, JSON.stringify(state));
 	}
 }

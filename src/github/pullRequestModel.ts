@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import * as buffer from 'buffer';
 import * as path from 'path';
 import equals from 'fast-deep-equal';
 import * as vscode from 'vscode';
@@ -14,7 +15,7 @@ import Logger from '../common/logger';
 import { Remote } from '../common/remote';
 import { ITelemetry } from '../common/telemetry';
 import { ReviewEvent as CommonReviewEvent, isReviewEvent, TimelineEvent } from '../common/timelineEvent';
-import { toPRUri, toReviewUri } from '../common/uri';
+import { resolvePath, toPRUri, toReviewUri } from '../common/uri';
 import { formatError } from '../common/utils';
 import { OctokitCommon } from './common';
 import { FolderRepositoryManager } from './folderRepositoryManager';
@@ -102,7 +103,7 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 	private _onDidChangeReviewThreads = new vscode.EventEmitter<ReviewThreadChangeEvent>();
 	public onDidChangeReviewThreads = this._onDidChangeReviewThreads.event;
 
-	public fileChangeViewedState:{ [key: string]: ViewedState } = {};
+	public fileChangeViewedState: { [key: string]: ViewedState } = {};
 	private _onDidChangeFileViewedState = new vscode.EventEmitter<FileViewedStateChangeEvent>();
 	public onDidChangeFileViewedState = this._onDidChangeFileViewedState.event;
 
@@ -153,7 +154,9 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 		}
 	}
 
+	public isRemoteHeadDeleted?: boolean;
 	public head: GitHubRef | null;
+	public isRemoteBaseDeleted?: boolean;
 	public base: GitHubRef;
 
 	protected updateState(state: string) {
@@ -169,10 +172,16 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 		this.isDraft = item.isDraft;
 		this.suggestedReviewers = item.suggestedReviewers;
 
+		if (item.isRemoteHeadDeleted != null) {
+			this.isRemoteHeadDeleted = item.isRemoteHeadDeleted;
+		}
 		if (item.head) {
 			this.head = new GitHubRef(item.head.ref, item.head.label, item.head.sha, item.head.repo.cloneUrl);
 		}
 
+		if (item.isRemoteBaseDeleted != null) {
+			this.isRemoteBaseDeleted = item.isRemoteBaseDeleted;
+		}
 		if (item.base) {
 			this.base = new GitHubRef(item.base.ref, item.base!.label, item.base!.sha, item.base!.repo.cloneUrl);
 		}
@@ -308,8 +317,16 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 
 			this.hasPendingReview = false;
 			await this.updateDraftModeContext();
+			const reviewEvent = parseGraphQLReviewEvent(data!.submitPullRequestReview.pullRequestReview, this.githubRepository);
 
-			return parseGraphQLReviewEvent(data!.submitPullRequestReview.pullRequestReview, this.githubRepository);
+			const threadWithComment = this._reviewThreadsCache.find(thread =>
+				thread.comments.length ? (thread.comments[0].pullRequestReviewId === reviewEvent.id) : undefined,
+			);
+			if (threadWithComment) {
+				threadWithComment.comments = reviewEvent.comments;
+				this._onDidChangeReviewThreads.fire({ added: [], changed: [threadWithComment], removed: [] });
+			}
+			return reviewEvent;
 		} else {
 			throw new Error(`Submitting review failed, no pending review for current pull request: ${this.number}.`);
 		}
@@ -358,7 +375,7 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 					author: currentUser,
 				},
 			});
-			return data.node.reviews.nodes[0].id;
+			return data.node.reviews.nodes.length > 0 ? data.node.reviews.nodes[0].id : undefined;
 		} catch (error) {
 			return;
 		}
@@ -433,7 +450,7 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 		line: number,
 		side: DiffSide,
 		suppressDraftModeUpdate?: boolean,
-	): Promise<IReviewThread> {
+	): Promise<IReviewThread | undefined> {
 		if (!this.validatePullRequestModel('Creating comment failed')) {
 			return;
 		}
@@ -453,6 +470,10 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 				},
 			},
 		});
+
+		if (!data) {
+			throw new Error('Creating review thread failed.');
+		}
 
 		if (!suppressDraftModeUpdate) {
 			this.hasPendingReview = true;
@@ -480,7 +501,7 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 		inReplyTo: string,
 		isSingleComment: boolean,
 		commitId?: string,
-	): Promise<IComment> {
+	): Promise<IComment | undefined> {
 		if (!this.validatePullRequestModel('Creating comment failed')) {
 			return;
 		}
@@ -502,6 +523,10 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 				},
 			},
 		});
+
+		if (!data) {
+			throw new Error('Creating comment reply failed.');
+		}
 
 		const { comment } = data.addPullRequestReviewComment;
 		const newComment = parseGraphQLComment(comment, false);
@@ -548,6 +573,13 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 	 */
 	async editReviewComment(comment: IComment, text: string): Promise<IComment> {
 		const { mutate, schema } = await this.githubRepository.ensure();
+		let threadWithComment = this._reviewThreadsCache.find(thread =>
+			thread.comments.some(c => c.graphNodeId === comment.graphNodeId),
+		);
+
+		if (!threadWithComment) {
+			return this.editIssueComment(comment, text);
+		}
 
 		const { data } = await mutate<EditCommentResponse>({
 			mutation: schema.EditComment,
@@ -559,12 +591,13 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 			},
 		});
 
+		if (!data) {
+			throw new Error('Editing review comment failed.');
+		}
+
 		const newComment = parseGraphQLComment(
 			data.updatePullRequestReviewComment.pullRequestReviewComment,
 			!!comment.isResolved,
-		);
-		const threadWithComment = this._reviewThreadsCache.find(thread =>
-			thread.comments.some(c => c.graphNodeId === comment.graphNodeId),
 		);
 		if (threadWithComment) {
 			const index = threadWithComment.comments.findIndex(c => c.graphNodeId === comment.graphNodeId);
@@ -583,23 +616,27 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 		try {
 			const { octokit, remote } = await this.githubRepository.ensure();
 			const id = Number(commentId);
-
-			await octokit.pulls.deleteReviewComment({
-				owner: remote.owner,
-				repo: remote.repositoryName,
-				comment_id: id,
-			});
-
 			const threadIndex = this._reviewThreadsCache.findIndex(thread => thread.comments.some(c => c.id === id));
-			if (threadIndex > -1) {
-				const threadWithComment = this._reviewThreadsCache[threadIndex];
-				const index = threadWithComment.comments.findIndex(c => c.id === id);
-				threadWithComment.comments.splice(index, 1);
-				if (threadWithComment.comments.length === 0) {
-					this._reviewThreadsCache.splice(threadIndex, 1);
-					this._onDidChangeReviewThreads.fire({ added: [], changed: [], removed: [threadWithComment] });
-				} else {
-					this._onDidChangeReviewThreads.fire({ added: [], changed: [threadWithComment], removed: [] });
+
+			if (threadIndex === -1) {
+				this.deleteIssueComment(commentId);
+			} else {
+				await octokit.pulls.deleteReviewComment({
+					owner: remote.owner,
+					repo: remote.repositoryName,
+					comment_id: id,
+				});
+
+				if (threadIndex > -1) {
+					const threadWithComment = this._reviewThreadsCache[threadIndex];
+					const index = threadWithComment.comments.findIndex(c => c.id === id);
+					threadWithComment.comments.splice(index, 1);
+					if (threadWithComment.comments.length === 0) {
+						this._reviewThreadsCache.splice(threadIndex, 1);
+						this._onDidChangeReviewThreads.fire({ added: [], changed: [], removed: [threadWithComment] });
+					} else {
+						this._onDidChangeReviewThreads.fire({ added: [], changed: [threadWithComment], removed: [] });
+					}
 				}
 			}
 		} catch (e) {
@@ -788,7 +825,7 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 				PullRequestModel.ID,
 			);
 
-			return fullCommit.data.files.filter(file => !!file.patch);
+			return fullCommit.data.files?.filter(file => !!file.patch) ?? [];
 		} catch (e) {
 			vscode.window.showErrorMessage(`Fetching commit file changes failed: ${formatError(e)}`);
 			return [];
@@ -814,7 +851,7 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 		}
 
 		const contents = (fileContent.data as any).content ?? '';
-		const buff = Buffer.from(contents, (fileContent.data as any).encoding);
+		const buff = buffer.Buffer.from(contents, (fileContent.data as any).encoding);
 		return buff.toString();
 	}
 
@@ -852,7 +889,7 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 
 		const reviewEvents = events.filter(isReviewEvent);
 		const reviewThreads = await this.getReviewThreads();
-		const reviewComments = reviewThreads.reduce((previous, current) => previous.concat(current.comments), []);
+		const reviewComments = reviewThreads.reduce((previous, current) => (previous as IComment[]).concat(current.comments), []);
 
 		const reviewEventsById = reviewEvents.reduce((index, evt) => {
 			index[evt.id] = evt;
@@ -897,14 +934,26 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 	 */
 	async getStatusChecks(): Promise<PullRequestChecks> {
 		const { query, remote, schema } = await this.githubRepository.ensure();
-		const result = await query<GetChecksResponse>({
-			query: schema.GetChecks,
-			variables: {
-				owner: remote.owner,
-				name: remote.repositoryName,
-				number: this.number,
-			},
-		});
+		let result;
+		try {
+			result = await query<GetChecksResponse>({
+				query: schema.GetChecks,
+				variables: {
+					owner: remote.owner,
+					name: remote.repositoryName,
+					number: this.number,
+				},
+			});
+		} catch (e) {
+			if (e.message?.startsWith('GraphQL error: Resource protected by organization SAML enforcement.')) {
+				// There seems to be an issue with fetching status checks if you haven't SAML'd with every org you have
+				// Ignore SAML errors here.
+				return {
+					state: 'pending',
+					statuses: [],
+				};
+			}
+		}
 
 		// We always fetch the status checks for only the last commit, so there should only be one node present
 		const statusCheckRollup = result.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup;
@@ -964,7 +1013,7 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 			const headCommit = pullRequestModel.head!.sha;
 			const parentFileName = change.status === GitChangeType.RENAME ? change.previousFileName! : change.fileName;
 			headUri = toPRUri(
-				vscode.Uri.file(path.resolve(folderManager.repository.rootUri.fsPath, change.fileName)),
+				vscode.Uri.file(resolvePath(folderManager.repository.rootUri, change.fileName)),
 				pullRequestModel,
 				change.baseCommit,
 				headCommit,
@@ -973,7 +1022,7 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 				change.status,
 			);
 			baseUri = toPRUri(
-				vscode.Uri.file(path.resolve(folderManager.repository.rootUri.fsPath, parentFileName)),
+				vscode.Uri.file(resolvePath(folderManager.repository.rootUri, parentFileName)),
 				pullRequestModel,
 				change.baseCommit,
 				headCommit,
@@ -987,14 +1036,14 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 			headUri =
 				change.status === GitChangeType.DELETE
 					? toReviewUri(
-							uri,
-							undefined,
-							undefined,
-							'',
-							false,
-							{ base: false },
-							folderManager.repository.rootUri,
-					  )
+						uri,
+						undefined,
+						undefined,
+						'',
+						false,
+						{ base: false },
+						folderManager.repository.rootUri,
+					)
 					: uri;
 
 			baseUri = toReviewUri(
@@ -1149,12 +1198,14 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 		);
 		if (reviewThread) {
 			const updatedComment = reviewThread.comments.find(c => c.graphNodeId === graphNodeId);
-			updatedComment.reactions = parseGraphQLReaction(reactionGroups);
-			this._onDidChangeReviewThreads.fire({ added: [], changed: [reviewThread], removed: [] });
+			if (updatedComment) {
+				updatedComment.reactions = parseGraphQLReaction(reactionGroups);
+				this._onDidChangeReviewThreads.fire({ added: [], changed: [reviewThread], removed: [] });
+			}
 		}
 	}
 
-	async addCommentReaction(graphNodeId: string, reaction: vscode.CommentReaction): Promise<AddReactionResponse> {
+	async addCommentReaction(graphNodeId: string, reaction: vscode.CommentReaction): Promise<AddReactionResponse | undefined> {
 		const reactionEmojiToContent = getReactionGroup().reduce((prev, curr) => {
 			prev[curr.label] = curr.title;
 			return prev;
@@ -1170,6 +1221,10 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 			},
 		});
 
+		if (!data) {
+			throw new Error('Add comment reaction failed.');
+		}
+
 		const reactionGroups = data.addReaction.subject.reactionGroups;
 		this.updateCommentReactions(graphNodeId, reactionGroups);
 
@@ -1179,7 +1234,7 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 	async deleteCommentReaction(
 		graphNodeId: string,
 		reaction: vscode.CommentReaction,
-	): Promise<DeleteReactionResponse> {
+	): Promise<DeleteReactionResponse | undefined> {
 		const reactionEmojiToContent = getReactionGroup().reduce((prev, curr) => {
 			prev[curr.label] = curr.title;
 			return prev;
@@ -1194,6 +1249,10 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 				},
 			},
 		});
+
+		if (!data) {
+			throw new Error('Delete comment reaction failed.');
+		}
 
 		const reactionGroups = data.removeReaction.subject.reactionGroups;
 		this.updateCommentReactions(graphNodeId, reactionGroups);
@@ -1211,6 +1270,10 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 				},
 			},
 		});
+
+		if (!data) {
+			throw new Error('Resolve review thread failed.');
+		}
 
 		const index = this._reviewThreadsCache.findIndex(thread => thread.id === threadId);
 		if (index > -1) {
@@ -1231,6 +1294,10 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 			},
 		});
 
+		if (!data) {
+			throw new Error('Unresolve review thread failed.');
+		}
+
 		const index = this._reviewThreadsCache.findIndex(thread => thread.id === threadId);
 		if (index > -1) {
 			const thread = parseGraphQLReviewThread(data.unresolveReviewThread.thread);
@@ -1243,17 +1310,17 @@ export class PullRequestModel extends IssueModel<PullRequest> implements IPullRe
 		const { query, schema, remote } = await this.githubRepository.ensure();
 
 		const changed: { fileName: string, viewed: ViewedState }[] = [];
-		let after = null;
+		let after: string | null = null;
 		let hasNextPage = false;
 
 		do {
 			const { data } = await query<PullRequestFilesResponse>({
 				query: schema.PullRequestFiles,
 				variables: {
-						owner: remote.owner,
-						name: remote.repositoryName,
-						number: this.number,
-						after: after,
+					owner: remote.owner,
+					name: remote.repositoryName,
+					number: this.number,
+					after: after,
 				},
 			});
 

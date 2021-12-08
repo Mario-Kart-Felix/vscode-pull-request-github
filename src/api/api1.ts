@@ -5,6 +5,7 @@
 
 import * as vscode from 'vscode';
 import { APIState, PublishEvent } from '../@types/git';
+import Logger from '../common/logger';
 import { TernarySearchTree } from '../common/utils';
 import { API, IGit, Repository } from './api';
 
@@ -93,12 +94,24 @@ export class GitApiImpl implements API, IGit, vscode.Disposable {
 		this._disposables = [];
 	}
 
+	private _updateReposContext() {
+		const reposCount = Array.from(this._providers.values()).reduce((prev, current) => {
+			return prev + current.repositories.length;
+		}, 0);
+		vscode.commands.executeCommand('setContext', 'gitHubOpenRepositoryCount', reposCount);
+	}
+
 	registerGitProvider(provider: IGit): vscode.Disposable {
+		Logger.appendLine(`Registering git provider`);
 		const handle = this._nextHandle();
 		this._providers.set(handle, provider);
 
 		this._disposables.push(provider.onDidCloseRepository(e => this._onDidCloseRepository.fire(e)));
-		this._disposables.push(provider.onDidOpenRepository(e => this._onDidOpenRepository.fire(e)));
+		this._disposables.push(provider.onDidOpenRepository(e => {
+			Logger.appendLine(`Repository ${e.rootUri} has been opened`);
+			this._updateReposContext();
+			this._onDidOpenRepository.fire(e);
+		}));
 		if (provider.onDidChangeState) {
 			this._disposables.push(provider.onDidChangeState(e => this._onDidChangeState.fire(e)));
 		}
@@ -106,6 +119,7 @@ export class GitApiImpl implements API, IGit, vscode.Disposable {
 			this._disposables.push(provider.onDidPublish(e => this._onDidPublish.fire(e)));
 		}
 
+		this._updateReposContext();
 		provider.repositories.forEach(repository => {
 			this._onDidOpenRepository.fire(repository);
 		});

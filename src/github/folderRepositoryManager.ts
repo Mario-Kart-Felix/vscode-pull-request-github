@@ -9,16 +9,18 @@ import type { Branch, Repository, UpstreamRef } from '../api/api';
 import { GitApiImpl, GitErrorCodes, RefType } from '../api/api1';
 import { GitHubManager } from '../authentication/githubServer';
 import Logger from '../common/logger';
-import { Protocol } from '../common/protocol';
+import { Protocol, ProtocolType } from '../common/protocol';
 import { parseRepositoryRemotes, Remote } from '../common/remote';
+import { ISessionState } from '../common/sessionState';
 import { ITelemetry } from '../common/telemetry';
 import { EventType, TimelineEvent } from '../common/timelineEvent';
 import { fromPRUri } from '../common/uri';
-import { formatError, Predicate } from '../common/utils';
+import { compareIgnoreCase, formatError, Predicate } from '../common/utils';
 import { EXTENSION_ID } from '../constants';
+import { REPO_KEYS, ReposState } from '../extensionState';
 import { UserCompletion, userMarkdown } from '../issues/util';
 import { OctokitCommon } from './common';
-import { CredentialStore } from './credentials';
+import { AuthProvider, CredentialStore } from './credentials';
 import { GitHubRepository, ItemsData, PullRequestData, ViewerPermission } from './githubRepository';
 import { PullRequestState, UserResponse } from './graphql';
 import { IAccount, ILabel, IPullRequestsPagingOptions, PRType, RepoAccessAndMergeMethods, User } from './interface';
@@ -146,6 +148,7 @@ export class FolderRepositoryManager implements vscode.Disposable {
 		public readonly telemetry: ITelemetry,
 		private _git: GitApiImpl,
 		private _credentialStore: CredentialStore,
+		private readonly _sessionState: ISessionState
 	) {
 		this._subs = [];
 		this._githubRepositories = [];
@@ -159,7 +162,29 @@ export class FolderRepositoryManager implements vscode.Disposable {
 			}),
 		);
 
+		this._subs.push(_credentialStore.onDidInitialize(() => this.updateRepositories()));
+
 		this.setUpCompletionItemProvider();
+
+		this.cleanStoredRepoState();
+	}
+
+	private cleanStoredRepoState() {
+		const deleteDate: number = new Date().valueOf() - 30 /*days*/ * 86400000 /*milliseconds in a day*/;
+		const reposState = this.context.globalState.get<ReposState>(REPO_KEYS);
+		if (reposState?.repos) {
+			let keysChanged = false;
+			Object.keys(reposState.repos).forEach(repo => {
+				const repoState = reposState.repos[repo];
+				if ((repoState.stateModifiedTime ?? 0) < deleteDate) {
+					keysChanged = true;
+					delete reposState.repos[repo];
+				}
+			});
+			if (keysChanged) {
+				this.context.globalState.update(REPO_KEYS, reposState);
+			}
+		}
 	}
 
 	get gitHubRepositories(): GitHubRepository[] {
@@ -188,11 +213,15 @@ export class FolderRepositoryManager implements vscode.Disposable {
 			return Promise.resolve([]);
 		}
 
-		remotesSetting.forEach(remote => {
-			if (!allGitHubRemotes.some(repo => repo.remoteName === remote)) {
-				Logger.appendLine(`No remote with name '${remote}' found.`);
-			}
+		const missingRemotes = remotesSetting.filter(remote => {
+			return !allGitHubRemotes.some(repo => repo.remoteName === remote);
 		});
+
+		if (missingRemotes.length === remotesSetting.length) {
+			Logger.appendLine(`No remotes found. The following remotes are missing: ${missingRemotes.join(', ')}`);
+		} else {
+			Logger.debug(`Not all remotes found. The following remotes are missing: ${missingRemotes.join(', ')}`, FolderRepositoryManager.ID);
+		}
 
 		Logger.debug(`Displaying configured remotes: ${remotesSetting.join(', ')}`, FolderRepositoryManager.ID);
 
@@ -212,7 +241,7 @@ export class FolderRepositoryManager implements vscode.Disposable {
 				provideCompletionItems: async (document, position, _token) => {
 					try {
 						const query = JSON.parse(document.uri.query);
-						if (query.extensionId !== EXTENSION_ID) {
+						if (compareIgnoreCase(query.extensionId, EXTENSION_ID) !== 0) {
 							return;
 						}
 
@@ -372,7 +401,7 @@ export class FolderRepositoryManager implements vscode.Disposable {
 									filterText:
 										`${prRelatedUsersMap[user].login}` +
 										(prRelatedUsersMap[user].name &&
-										prRelatedUsersMap[user].name !== prRelatedUsersMap[user].login
+											prRelatedUsersMap[user].name !== prRelatedUsersMap[user].login
 											? `_${prRelatedUsersMap[user].name!.toLowerCase().replace(' ', '_')}`
 											: ''),
 									sortText: `0_${prRelatedUsersMap[user].login}`,
@@ -393,7 +422,7 @@ export class FolderRepositoryManager implements vscode.Disposable {
 				resolveCompletionItem: async (item: vscode.CompletionItem, _token: vscode.CancellationToken) => {
 					try {
 						const repo = await this.getPullRequestDefaults();
-						const user: User | undefined = await this.resolveUser(repo.owner, repo.repo, item.label);
+						const user: User | undefined = await this.resolveUser(repo.owner, repo.repo, (typeof item.label === 'string') ? item.label : item.label.label);
 						if (user) {
 							item.documentation = userMarkdown(repo, user);
 						}
@@ -445,6 +474,19 @@ export class FolderRepositoryManager implements vscode.Disposable {
 		return this._credentialStore;
 	}
 
+	public async loginAndUpdate() {
+		if (!this._credentialStore.isAnyAuthenticated()) {
+			const waitForRepos = new Promise<void>(c => {
+				const onReposChange = this.onDidChangeRepositories(() => {
+					onReposChange.dispose();
+					c();
+				});
+			});
+			await this._credentialStore.login(AuthProvider.github);
+			await waitForRepos;
+		}
+	}
+
 	private async getActiveRemotes(): Promise<Remote[]> {
 		this._allGitHubRemotes = await this.computeAllGitHubRemotes();
 		const activeRemotes = await this.getActiveGitHubRemotes(this._allGitHubRemotes);
@@ -460,7 +502,16 @@ export class FolderRepositoryManager implements vscode.Disposable {
 		return activeRemotes;
 	}
 
+	private _updatingRepositories: Promise<void> | undefined;
 	async updateRepositories(silent: boolean = false): Promise<void> {
+		if (this._updatingRepositories) {
+			await this._updatingRepositories;
+		}
+		this._updatingRepositories = this.doUpdateRepositories(silent);
+		return this._updatingRepositories;
+	}
+
+	private async doUpdateRepositories(silent: boolean): Promise<void> {
 		if (this._git.state === 'uninitialized') {
 			Logger.appendLine('Cannot updates repositories as git is uninitialized');
 
@@ -468,20 +519,24 @@ export class FolderRepositoryManager implements vscode.Disposable {
 		}
 
 		const activeRemotes = await this.getActiveRemotes();
-		const isAuthenticated = this._credentialStore.isAuthenticated();
+		const isAuthenticated = this._credentialStore.isAuthenticated(AuthProvider.github) || this._credentialStore.isAuthenticated(AuthProvider['github-enterprise']);
 		vscode.commands.executeCommand('setContext', 'github:authenticated', isAuthenticated);
 
 		const repositories: GitHubRepository[] = [];
-		const resolveRemotePromises: Promise<void>[] = [];
+		const resolveRemotePromises: Promise<boolean>[] = [];
 
-		const authenticatedRemotes = isAuthenticated ? activeRemotes : [];
+		const authenticatedRemotes = activeRemotes.filter(remote => this._credentialStore.isAuthenticated(remote.authProviderId));
 		authenticatedRemotes.forEach(remote => {
 			const repository = this.createGitHubRepository(remote, this._credentialStore);
 			resolveRemotePromises.push(repository.resolveRemote());
 			repositories.push(repository);
 		});
 
-		return Promise.all(resolveRemotePromises).then(_ => {
+		return Promise.all(resolveRemotePromises).then(async (remoteResults: boolean[]) => {
+			if (remoteResults.some(value => !value)) {
+				return this._credentialStore.showSamlMessageAndAuth();
+			}
+
 			const oldRepositories = this._githubRepositories;
 			this._githubRepositories = repositories;
 			oldRepositories.forEach(repo => repo.dispose());
@@ -493,10 +548,16 @@ export class FolderRepositoryManager implements vscode.Disposable {
 				);
 
 			if (this._githubRepositories.length && repositoriesChanged) {
-				this.checkIfMissingUpstream();
+				if (await this.checkIfMissingUpstream()) {
+					this.updateRepositories(silent);
+					return;
+				}
 			}
 
-			this.getMentionableUsers(repositoriesChanged);
+			if (this.activePullRequest) {
+				this.getMentionableUsers(repositoriesChanged, true);
+			}
+
 			this.getAssignableUsers(repositoriesChanged);
 			this._onDidLoadRepositories.fire(
 				isAuthenticated || !activeRemotes.length
@@ -506,15 +567,15 @@ export class FolderRepositoryManager implements vscode.Disposable {
 			if (!silent) {
 				this._onDidChangeRepositories.fire();
 			}
-			return Promise.resolve();
+			return;
 		});
 	}
 
-	private async checkIfMissingUpstream(): Promise<void> {
+	private async checkIfMissingUpstream(): Promise<boolean> {
 		try {
 			const origin = await this.getOrigin();
 			const metadata = await origin.getMetadata();
-			if (metadata.fork) {
+			if (metadata.fork && metadata.parent) {
 				const parentUrl = new Protocol(metadata.parent.git_url);
 				const missingParentRemote = !this._githubRepositories.some(
 					repo =>
@@ -524,14 +585,24 @@ export class FolderRepositoryManager implements vscode.Disposable {
 
 				if (missingParentRemote) {
 					const upstreamAvailable = !this.repository.state.remotes.some(remote => remote.name === 'upstream');
-					const remoteName = upstreamAvailable ? 'upstream' : metadata.parent.owner.login;
-					await this.repository.addRemote(remoteName, metadata.parent.clone_url);
+					const remoteName = upstreamAvailable ? 'upstream' : metadata.parent.owner?.login;
+					if (remoteName) {
+						// check the remotes to see what protocol is being used
+						const isSSH = this.gitHubRepositories[0].remote.gitProtocol.type === ProtocolType.SSH;
+						if (isSSH) {
+							await this.repository.addRemote(remoteName, metadata.parent.git_url);
+						} else {
+							await this.repository.addRemote(remoteName, metadata.parent.clone_url);
+						}
+						return true;
+					}
 				}
 			}
 		} catch (e) {
 			Logger.appendLine(`Missing upstream check failed: ${e}`);
 			// ignore
 		}
+		return false;
 	}
 
 	getAllAssignableUsers(): IAccount[] | undefined {
@@ -547,7 +618,56 @@ export class FolderRepositoryManager implements vscode.Disposable {
 		return undefined;
 	}
 
-	async getMentionableUsers(clearCache?: boolean): Promise<{ [key: string]: IAccount[] }> {
+	private getMentionableUsersFromGlobalState(): { [key: string]: IAccount[] } | undefined {
+		Logger.appendLine('Trying to use globalState for mentionable users.');
+		const reposState = this.context.globalState.get<ReposState>(REPO_KEYS);
+		if (reposState) {
+			const cache: { [key: string]: IAccount[] } = {};
+			const hasAllRepos = this._githubRepositories.every(repo => {
+				const key = `${repo.remote.owner}/${repo.remote.repositoryName}`;
+				if (!reposState.repos[key]) {
+					return false;
+				}
+				cache[repo.remote.repositoryName] = reposState.repos[key].mentionableUsers ?? [];
+				return true;
+			});
+			if (hasAllRepos) {
+				Logger.appendLine(`Using globalState mentionable users for ${Object.keys(cache).length}.`);
+				return cache;
+			}
+		}
+		Logger.appendLine(`No globalState for mentionable users.`);
+		return undefined;
+	}
+
+	private createFetchMentionableUsersPromise(): Promise<{ [key: string]: IAccount[] }> {
+		const cache: { [key: string]: IAccount[] } = {};
+		return new Promise<{ [key: string]: IAccount[] }>(resolve => {
+			const promises = this._githubRepositories.map(async githubRepository => {
+				const data = await githubRepository.getMentionableUsers();
+				cache[githubRepository.remote.remoteName] = data;
+				return;
+			});
+
+			Promise.all(promises).then(() => {
+				this._mentionableUsers = cache;
+				this._fetchMentionableUsersPromise = undefined;
+				const globalReposState = this.context.globalState.get<ReposState>(REPO_KEYS, { repos: {} });
+				this._githubRepositories.forEach(repo => {
+					const key = `${repo.remote.owner}/${repo.remote.repositoryName}`;
+					if (!globalReposState.repos[key]) {
+						globalReposState.repos[key] = {};
+					}
+					globalReposState.repos[key].mentionableUsers = cache[repo.remote.remoteName];
+					globalReposState.repos[key].stateModifiedTime = new Date().valueOf();
+				});
+				this.context.globalState.update(REPO_KEYS, globalReposState);
+				resolve(cache);
+			});
+		});
+	}
+
+	async getMentionableUsers(clearCache?: boolean, useGlobalState?: boolean): Promise<{ [key: string]: IAccount[] }> {
 		if (clearCache) {
 			delete this._mentionableUsers;
 		}
@@ -556,21 +676,14 @@ export class FolderRepositoryManager implements vscode.Disposable {
 			return this._mentionableUsers;
 		}
 
-		if (!this._fetchMentionableUsersPromise) {
-			const cache: { [key: string]: IAccount[] } = {};
-			return (this._fetchMentionableUsersPromise = new Promise(resolve => {
-				const promises = this._githubRepositories.map(async githubRepository => {
-					const data = await githubRepository.getMentionableUsers();
-					cache[githubRepository.remote.remoteName] = data;
-					return;
-				});
+		let globalStateMentionableUsers = this.getMentionableUsersFromGlobalState();
+		if (useGlobalState && !this._fetchMentionableUsersPromise && globalStateMentionableUsers) {
+			return globalStateMentionableUsers;
+		}
 
-				Promise.all(promises).then(() => {
-					this._mentionableUsers = cache;
-					this._fetchMentionableUsersPromise = undefined;
-					resolve(cache);
-				});
-			}));
+		if (!this._fetchMentionableUsersPromise) {
+			this._fetchMentionableUsersPromise = this.createFetchMentionableUsersPromise();
+			return globalStateMentionableUsers ?? this._fetchMentionableUsersPromise;
 		}
 
 		return this._fetchMentionableUsersPromise;
@@ -674,8 +787,8 @@ export class FolderRepositoryManager implements vscode.Disposable {
 		const repo = issue
 			? issue.githubRepository
 			: this._githubRepositories.find(
-					r => r.remote.owner === repoInfo?.owner && r.remote.repositoryName === repoInfo?.repo,
-			  );
+				r => r.remote.owner === repoInfo?.owner && r.remote.repositoryName === repoInfo?.repo,
+			);
 		if (!repo) {
 			throw new Error(`No matching repository found for getting labels.`);
 		}
@@ -728,7 +841,7 @@ export class FolderRepositoryManager implements vscode.Disposable {
 		let remoteName: string | undefined = undefined;
 		try {
 			remoteName = await this.repository.getConfig(`branch.${pullRequest.localBranchName}.remote`);
-		} catch (e) {}
+		} catch (e) { }
 
 		if (!remoteName) {
 			return;
@@ -960,22 +1073,22 @@ export class FolderRepositoryManager implements vscode.Disposable {
 		 */
 		const templatesPattern1 = await vscode.workspace.findFiles(
 			new vscode.RelativePattern(
-				this._repository.rootUri.path,
+				this._repository.rootUri,
 				'{pull_request_template,PULL_REQUEST_TEMPLATE}.md',
 			),
 		);
 		const templatesPattern2 = await vscode.workspace.findFiles(
 			new vscode.RelativePattern(
-				this._repository.rootUri.path,
+				this._repository.rootUri,
 				'{docs,.github}/{pull_request_template,PULL_REQUEST_TEMPLATE}.md',
 			),
 		);
 
 		const templatesPattern3 = await vscode.workspace.findFiles(
-			new vscode.RelativePattern(this._repository.rootUri.path, 'PULL_REQUEST_TEMPLATE/*.md'),
+			new vscode.RelativePattern(this._repository.rootUri, 'PULL_REQUEST_TEMPLATE/*.md'),
 		);
 		const templatesPattern4 = await vscode.workspace.findFiles(
-			new vscode.RelativePattern(this._repository.rootUri.path, '{docs,.github}/PULL_REQUEST_TEMPLATE/*.md'),
+			new vscode.RelativePattern(this._repository.rootUri, '{docs,.github}/PULL_REQUEST_TEMPLATE/*.md'),
 		);
 
 		return [...templatesPattern1, ...templatesPattern2, ...templatesPattern3, ...templatesPattern4];
@@ -988,12 +1101,15 @@ export class FolderRepositoryManager implements vscode.Disposable {
 
 		const origin = await this.getOrigin(branch);
 		const meta = await origin.getMetadata();
-		const parent = meta.fork
+		const remotesSettingDefault = vscode.workspace.getConfiguration(SETTINGS_NAMESPACE).inspect<string[]>(REMOTES_SETTING)?.defaultValue;
+		const remotesSettingSetValue = vscode.workspace.getConfiguration(SETTINGS_NAMESPACE).get<string[]>(REMOTES_SETTING);
+		const settingsEqual = (!remotesSettingSetValue || remotesSettingDefault?.every((value, index) => remotesSettingSetValue[index] === value));
+		const parent = (meta.fork && meta.parent && settingsEqual)
 			? meta.parent
 			: await (this.findRepo(byRemoteName('upstream')) || origin).getMetadata();
 
 		return {
-			owner: parent.owner.login,
+			owner: parent.owner!.login,
 			repo: parent.name,
 			base: parent.default_branch,
 		};
@@ -1040,7 +1156,7 @@ export class FolderRepositoryManager implements vscode.Disposable {
 			if (!upstream) {
 				const remote = (await this.getAllGitHubRemotes()).find(r => r.remoteName === upstreamRef.remote);
 				if (remote) {
-					return new GitHubRepository(remote, this._credentialStore, this.telemetry);
+					return new GitHubRepository(remote, this._credentialStore, this.telemetry, this._sessionState);
 				}
 
 				Logger.appendLine(`The remote '${upstreamRef.remote}' is not a GitHub repository.`);
@@ -1059,9 +1175,9 @@ export class FolderRepositoryManager implements vscode.Disposable {
 		return !rest.length // Is there only one GitHub remote?
 			? first // I GUESS THAT'S WHAT WE'RE GOING WITH, THEN.
 			: // Otherwise, let's try...
-			  this.findRepo(byRemoteName('origin')) || // by convention
-					this.findRepo(ownedByMe) || // bc maybe we can push there
-					first; // out of raw desperation
+			this.findRepo(byRemoteName('origin')) || // by convention
+			this.findRepo(ownedByMe) || // bc maybe we can push there
+			first; // out of raw desperation
 	}
 
 	findRepo(where: Predicate<GitHubRepository>): GitHubRepository | undefined {
@@ -1233,7 +1349,7 @@ export class FolderRepositoryManager implements vscode.Disposable {
 	}
 
 	getCurrentUser(issueModel: IssueModel): IAccount {
-		return convertRESTUserToAccount(this._credentialStore.getCurrentUser(), issueModel.githubRepository);
+		return convertRESTUserToAccount(this._credentialStore.getCurrentUser(issueModel.githubRepository.remote.authProviderId), issueModel.githubRepository);
 	}
 
 	async mergePullRequest(
@@ -1258,8 +1374,7 @@ export class FolderRepositoryManager implements vscode.Disposable {
 				if (
 					ahead &&
 					(await vscode.window.showWarningMessage(
-						`You have ${ahead} unpushed ${
-							ahead > 1 ? 'commits' : 'commit'
+						`You have ${ahead} unpushed ${ahead > 1 ? 'commits' : 'commit'
 						} on this PR branch.\n\nWould you like to proceed anyway?`,
 						{ modal: true },
 						'Yes',
@@ -1358,17 +1473,16 @@ export class FolderRepositoryManager implements vscode.Disposable {
 				const activePRUrl = this.activePullRequest && this.activePullRequest.base.repositoryCloneUrl;
 				const matchesActiveBranch = activePRUrl
 					? activePRUrl.owner === value.metadata.owner &&
-					  activePRUrl.repositoryName === value.metadata.repositoryName &&
-					  this.activePullRequest &&
-					  this.activePullRequest.number === value.metadata.prNumber
+					activePRUrl.repositoryName === value.metadata.repositoryName &&
+					this.activePullRequest &&
+					this.activePullRequest.number === value.metadata.prNumber
 					: false;
 
 				if (!matchesActiveBranch) {
 					actions.push({
 						label: `${key}`,
-						description: `${value.metadata!.repositoryName}/${value.metadata!.owner} #${
-							value.metadata.prNumber
-						}`,
+						description: `${value.metadata!.repositoryName}/${value.metadata!.owner} #${value.metadata.prNumber
+							}`,
 						picked: false,
 						metadata: value.metadata!,
 					});
@@ -1401,7 +1515,7 @@ export class FolderRepositoryManager implements vscode.Disposable {
 					});
 
 					action.legacy = data.repository.pullRequest.state !== 'OPEN';
-				} catch {}
+				} catch { }
 
 				return action;
 			}),
@@ -1657,9 +1771,12 @@ export class FolderRepositoryManager implements vscode.Disposable {
 					login,
 				},
 			});
-			return parseGraphQLUser(data);
+			return parseGraphQLUser(data, githubRepository);
 		} catch (e) {
-			console.log(e);
+			// Ignore cases where the user doesn't exist
+			if (!(e.message as string).startsWith('GraphQL error: Could not resolve to a User with the login of')) {
+				Logger.appendLine(e.message);
+			}
 		}
 		return undefined;
 	}
@@ -1724,9 +1841,24 @@ export class FolderRepositoryManager implements vscode.Disposable {
 		return this.repository.checkout(branchName);
 	}
 
+	async fetchById(githubRepo: GitHubRepository, id: number): Promise<PullRequestModel | undefined> {
+		const pullRequest = await githubRepo.getPullRequest(id);
+		if (pullRequest) {
+			return pullRequest;
+		} else {
+			vscode.window.showErrorMessage(`Pull request number ${id} does not exist in ${githubRepo.remote.owner}/${githubRepo.remote.repositoryName}`, { modal: true });
+		}
+	}
+
 	public async checkoutDefaultBranch(branch: string): Promise<void> {
 		try {
 			const branchObj = await this.repository.getBranch(branch);
+
+			const currentBranch = this.repository.state.HEAD?.name;
+			if (currentBranch === branchObj.name) {
+				vscode.window.showInformationMessage('The default branch is already checked out.');
+				return;
+			}
 
 			if (branchObj.upstream && branch === branchObj.upstream.name) {
 				await this.repository.checkout(branch);
@@ -1748,13 +1880,33 @@ export class FolderRepositoryManager implements vscode.Disposable {
 		}
 	}
 
-	createGitHubRepository(remote: Remote, credentialStore: CredentialStore): GitHubRepository {
-		return new GitHubRepository(remote, credentialStore, this.telemetry);
+	private findExistingGitHubRepository(remote: { owner: string, repositoryName: string, remoteName?: string }): GitHubRepository | undefined {
+		return this._githubRepositories.find(
+			r =>
+				(r.remote.owner === remote.owner)
+				&& (r.remote.repositoryName === remote.repositoryName)
+				&& (!remote.remoteName || (r.remote.remoteName === remote.remoteName)),
+		);
 	}
 
-	createGitHubRepositoryFromOwnerName(owner: string, name: string): GitHubRepository {
-		const uri = `https://github.com/${owner}/${name}`;
-		return new GitHubRepository(new Remote(name, uri, new Protocol(uri)), this._credentialStore, this.telemetry);
+	private createAndAddGitHubRepository(remote: Remote, credentialStore: CredentialStore) {
+		const repo = new GitHubRepository(remote, credentialStore, this.telemetry, this._sessionState);
+		this._githubRepositories.push(repo);
+		return repo;
+	}
+
+	createGitHubRepository(remote: Remote, credentialStore: CredentialStore): GitHubRepository {
+		return this.findExistingGitHubRepository(remote) ??
+			this.createAndAddGitHubRepository(remote, credentialStore);
+	}
+
+	createGitHubRepositoryFromOwnerName(owner: string, repositoryName: string): GitHubRepository {
+		const existing = this.findExistingGitHubRepository({owner, repositoryName});
+		if (existing) {
+			return existing;
+		}
+		const uri = `https://github.com/${owner}/${repositoryName}`;
+		return this.createAndAddGitHubRepository(new Remote(repositoryName, uri, new Protocol(uri)), this._credentialStore);
 	}
 
 	async findUpstreamForItem(item: {
@@ -1776,7 +1928,7 @@ export class FolderRepositoryManager implements vscode.Disposable {
 			if (
 				forkDetails &&
 				forkDetails.isFork &&
-				forkDetails.parent.owner === item.remote.owner &&
+				forkDetails.parent.owner.login === item.remote.owner &&
 				forkDetails.parent.name === item.remote.repositoryName
 			) {
 				const foundforkPermission = await githubRepo.getViewerPermission();

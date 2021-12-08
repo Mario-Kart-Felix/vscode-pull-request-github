@@ -7,10 +7,11 @@ import { Octokit } from '@octokit/rest';
 import * as OctokitTypes from '@octokit/types';
 import { ApolloQueryResult, FetchResult, MutationOptions, NetworkStatus, QueryOptions } from 'apollo-boost';
 import * as vscode from 'vscode';
-import { AuthenticationError } from '../common/authentication';
+import { AuthenticationError, isSamlError } from '../common/authentication';
 import Logger from '../common/logger';
 import { Protocol } from '../common/protocol';
 import { parseRemote, Remote } from '../common/remote';
+import { ISessionState } from '../common/sessionState';
 import { ITelemetry } from '../common/telemetry';
 import { PRCommentControllerRegistry } from '../view/pullRequestCommentControllerRegistry';
 import { OctokitCommon } from './common';
@@ -74,7 +75,9 @@ export enum ViewerPermission {
 export interface ForkDetails {
 	isFork: boolean;
 	parent: {
-		owner: string;
+		owner: {
+			login: string;
+		};
 		name: string;
 	};
 }
@@ -120,8 +123,8 @@ export class GitHubRepository implements vscode.Disposable {
 				`github-browse-${this.remote.normalizedHost}`,
 				`GitHub Pull Request for ${this.remote.normalizedHost}`,
 			);
-			this.commentsHandler = new PRCommentControllerRegistry(this.commentsController);
-			this._toDispose.push(this.commentsController);
+			this.commentsHandler = new PRCommentControllerRegistry(this.commentsController, this._sessionState);
+			this._toDispose.push(this.commentsHandler);
 			this._toDispose.push(this.commentsController);
 		} catch (e) {
 			console.log(e);
@@ -140,6 +143,7 @@ export class GitHubRepository implements vscode.Disposable {
 		public remote: Remote,
 		private readonly _credentialStore: CredentialStore,
 		private readonly _telemetry: ITelemetry,
+		private readonly _sessionState: ISessionState
 	) {
 		this.isGitHubDotCom = remote.host.toLowerCase() === 'github.com';
 	}
@@ -157,7 +161,18 @@ export class GitHubRepository implements vscode.Disposable {
 		}
 
 		Logger.debug(`Request: ${JSON.stringify(query, null, 2)}`, GRAPHQL_COMPONENT_ID);
-		const rsp = await gql.query<T>(query);
+		let rsp;
+		try {
+			rsp = await gql.query<T>(query);
+		} catch (e) {
+			// There's an issue with the GetChecks that can result in this error.
+			if ((query.query !== this.schema.GetChecks) && e.message?.startsWith('GraphQL error: Resource protected by organization SAML enforcement.')) {
+				await this._credentialStore.recreate();
+				rsp = await gql.query<T>(query);
+			} else {
+				throw e;
+			}
+		}
 		Logger.debug(`Response: ${JSON.stringify(rsp, null, 2)}`, GRAPHQL_COMPONENT_ID);
 		return rsp;
 	};
@@ -188,7 +203,7 @@ export class GitHubRepository implements vscode.Disposable {
 		Logger.debug(`Fetch metadata - enter`, GitHubRepository.ID);
 		if (this._metadata) {
 			Logger.debug(
-				`Fetch metadata ${this._metadata.owner.login}/${this._metadata.name} - done`,
+				`Fetch metadata ${this._metadata.owner?.login}/${this._metadata.name} - done`,
 				GitHubRepository.ID,
 			);
 			return this._metadata;
@@ -203,22 +218,26 @@ export class GitHubRepository implements vscode.Disposable {
 		return this._metadata;
 	}
 
-	async resolveRemote(): Promise<void> {
+	async resolveRemote(): Promise<boolean> {
 		try {
 			const { clone_url } = await this.getMetadata();
 			this.remote = parseRemote(this.remote.remoteName, clone_url, this.remote.gitProtocol)!;
 		} catch (e) {
 			Logger.appendLine(`Unable to resolve remote: ${e}`);
+			if (isSamlError(e)) {
+				return false;
+			}
 		}
+		return true;
 	}
 
 	async ensure(): Promise<GitHubRepository> {
 		this._initialized = true;
 
-		if (!this._credentialStore.isAuthenticated()) {
-			this._hub = await this._credentialStore.showSignInNotification();
+		if (!this._credentialStore.isAuthenticated(this.remote.authProviderId)) {
+			this._hub = await this._credentialStore.showSignInNotification(this.remote.authProviderId);
 		} else {
-			this._hub = this._credentialStore.getHub();
+			this._hub = this._credentialStore.getHub(this.remote.authProviderId);
 		}
 
 		return this;
@@ -379,7 +398,7 @@ export class GitHubRepository implements vscode.Disposable {
 				parsedIssue.repositoryUrl,
 				new Protocol(parsedIssue.repositoryUrl),
 			);
-			githubRepository = new GitHubRepository(remote, this._credentialStore, this._telemetry);
+			githubRepository = new GitHubRepository(remote, this._credentialStore, this._telemetry, this._sessionState);
 		}
 		return githubRepository;
 	}
@@ -393,7 +412,7 @@ export class GitHubRepository implements vscode.Disposable {
 				variables: {
 					owner: remote.owner,
 					name: remote.repositoryName,
-					assignee: this._credentialStore.getCurrentUser().login,
+					assignee: this._credentialStore.getCurrentUser(remote.authProviderId)?.login,
 				},
 			});
 			Logger.debug(`Fetch all issues - done`, GitHubRepository.ID);
@@ -433,7 +452,7 @@ export class GitHubRepository implements vscode.Disposable {
 				variables: {
 					owner: remote.owner,
 					name: remote.repositoryName,
-					assignee: this._credentialStore.getCurrentUser().login,
+					assignee: this._credentialStore.getCurrentUser(remote.authProviderId)?.login,
 				},
 			});
 			Logger.debug(`Fetch issues without milestone - done`, GitHubRepository.ID);
@@ -551,19 +570,19 @@ export class GitHubRepository implements vscode.Disposable {
 
 	async getRepositoryForkDetails(): Promise<ForkDetails | undefined> {
 		try {
-			Logger.debug(`Fetch viewer permission - enter`, GitHubRepository.ID);
+			Logger.debug(`Fetch repository fork details - enter`, GitHubRepository.ID);
 			const { query, remote, schema } = await this.ensure();
 			const { data } = await query<ForkDetailsResponse>({
-				query: schema.GetViewerPermission,
+				query: schema.GetRepositoryForkDetails,
 				variables: {
 					owner: remote.owner,
 					name: remote.repositoryName,
 				},
 			});
-			Logger.debug(`Fetch viewer permission - done`, GitHubRepository.ID);
+			Logger.debug(`Fetch repository fork details - done`, GitHubRepository.ID);
 			return data.repository;
 		} catch (e) {
-			Logger.appendLine(`GithubRepository> Unable to fetch viewer permission: ${e}`);
+			Logger.appendLine(`GithubRepository> Unable to fetch repository fork details: ${e}`);
 			return;
 		}
 	}
@@ -642,6 +661,7 @@ export class GitHubRepository implements vscode.Disposable {
 			model.update(pullRequest);
 		} else {
 			model = new PullRequestModel(this._telemetry, this, this.remote, pullRequest);
+			model.onDidInvalidate(() => this.getPullRequest(pullRequest.number));
 			this._pullRequestModels.set(pullRequest.number, model);
 		}
 
@@ -703,17 +723,24 @@ export class GitHubRepository implements vscode.Disposable {
 		Logger.debug(`List branches for ${owner}/${repositoryName} - enter`, GitHubRepository.ID);
 
 		try {
-			const result = (await octokit.paginate<OctokitCommon.ReposListBranchesResponseData>(
+			let branches: string[] = [];
+			const startingTime = new Date().getTime();
+			for await (const response of octokit.paginate.iterator<OctokitCommon.ReposListBranchesResponseData>(
 				'GET /repos/:owner/:repo/branches',
 				{
 					owner: owner,
 					repo: repositoryName,
-					per_page: 100,
+					per_page: 100
 				},
-			)) as any;
+			) as any) {
+				branches.push(...response.data.map(branch => branch.name));
+				if (new Date().getTime() - startingTime > 5000) {
+					break;
+				}
+			}
 
 			Logger.debug(`List branches for ${owner}/${repositoryName} - done`, GitHubRepository.ID);
-			return result.map(branch => branch.name);
+			return branches;
 		} catch (e) {
 			Logger.debug(`List branches for ${owner}/${repositoryName} failed`, GitHubRepository.ID);
 			throw e;
@@ -743,7 +770,7 @@ export class GitHubRepository implements vscode.Disposable {
 		Logger.debug(`Fetch mentionable users - enter`, GitHubRepository.ID);
 		const { query, remote, schema } = await this.ensure();
 
-		let after = null;
+		let after: string | null = null;
 		let hasNextPage = false;
 		const ret: IAccount[] = [];
 
@@ -786,7 +813,7 @@ export class GitHubRepository implements vscode.Disposable {
 		Logger.debug(`Fetch assignable users - enter`, GitHubRepository.ID);
 		const { query, remote, schema } = await this.ensure();
 
-		let after = null;
+		let after: string | null = null;
 		let hasNextPage = false;
 		const ret: IAccount[] = [];
 
