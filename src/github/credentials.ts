@@ -7,7 +7,7 @@ import { Octokit } from '@octokit/rest';
 import { ApolloClient, InMemoryCache, NormalizedCacheObject } from 'apollo-boost';
 import { setContext } from 'apollo-link-context';
 import { createHttpLink } from 'apollo-link-http';
-import fetch from 'node-fetch';
+import fetch from 'cross-fetch';
 import * as vscode from 'vscode';
 import Logger from '../common/logger';
 import * as PersistentState from '../common/persistentState';
@@ -47,22 +47,31 @@ export class CredentialStore implements vscode.Disposable {
 	private _onDidInitialize: vscode.EventEmitter<void> = new vscode.EventEmitter();
 	public readonly onDidInitialize: vscode.Event<void> = this._onDidInitialize.event;
 
+	private _onDidGetSession: vscode.EventEmitter<void> = new vscode.EventEmitter();
+	public readonly onDidGetSession = this._onDidGetSession.event;
+
 	constructor(private readonly _telemetry: ITelemetry) {
 		this._disposables = [];
 		this._disposables.push(
-			vscode.authentication.onDidChangeSessions(() => {
+			vscode.authentication.onDidChangeSessions(async () => {
+				const promises: Promise<any>[] = [];
 				if (!this.isAuthenticated(AuthProvider.github)) {
-					this.initialize(AuthProvider.github);
+					promises.push(this.initialize(AuthProvider.github));
 				}
 
 				if (!this.isAuthenticated(AuthProvider['github-enterprise']) && hasEnterpriseUri()) {
-					this.initialize(AuthProvider['github-enterprise']);
+					promises.push(this.initialize(AuthProvider['github-enterprise']));
+				}
+
+				await Promise.all(promises);
+				if (this.isAnyAuthenticated()) {
+					this._onDidGetSession.fire();
 				}
 			}),
 		);
 	}
 
-	public async initialize(authProviderId: AuthProvider, getAuthSessionOptions?: vscode.AuthenticationGetSessionOptions): Promise<void> {
+	private async initialize(authProviderId: AuthProvider, getAuthSessionOptions?: vscode.AuthenticationGetSessionOptions): Promise<void> {
 		if (authProviderId === AuthProvider['github-enterprise']) {
 			if (!hasEnterpriseUri()) {
 				Logger.debug(`GitHub Enterprise provider selected without URI.`, 'Authentication');
@@ -109,11 +118,11 @@ export class CredentialStore implements vscode.Disposable {
 	}
 
 	public async create(options: vscode.AuthenticationGetSessionOptions = {}) {
-		this.doCreate(options);
+		return this.doCreate(options);
 	}
 
-	public async recreate() {
-		return this.doCreate({ forceNewSession: true });
+	public async recreate(reason?: string) {
+		return this.doCreate({ forceNewSession: reason ? { detail: reason } : true });
 	}
 
 	public async reset() {
@@ -219,10 +228,7 @@ export class CredentialStore implements vscode.Disposable {
 	}
 
 	public async showSamlMessageAndAuth() {
-		const result = await vscode.window.showWarningMessage('GitHub Pull Requests and Issues requires that you provide SAML access to your organization when you sign in.', { modal: true }, 'OK');
-		if (result === 'OK') {
-			return this.recreate();
-		}
+		return this.recreate('GitHub Pull Requests and Issues requires that you provide SAML access to your organization when you sign in.');
 	}
 
 	public isCurrentUser(username: string): boolean {

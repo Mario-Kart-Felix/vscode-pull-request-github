@@ -56,7 +56,7 @@ export class PullRequestGitHelper {
 		// set remote tracking branch for the local branch
 		await repository.setBranchUpstream(localBranchName, `refs/remotes/${remoteName}/${pullRequest.head.ref}`);
 		await this.unshallow(repository);
-		PullRequestGitHelper.associateBranchWithPullRequest(repository, pullRequest, localBranchName);
+		await PullRequestGitHelper.associateBranchWithPullRequest(repository, pullRequest, localBranchName);
 	}
 
 	static async fetchAndCheckout(
@@ -126,7 +126,12 @@ export class PullRequestGitHelper {
 			await repository.pull(true);
 		} catch (e) {
 			Logger.appendLine(`Unshallowing failed: ${e}. Falling back to git pull`);
-			await repository.pull();
+			try {
+				await repository.pull(false);
+			} catch (e) {
+				Logger.appendLine(`Pull after failed unshallow still failed: ${e}`);
+				throw e;
+			}
 		}
 	}
 

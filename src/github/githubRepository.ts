@@ -97,6 +97,9 @@ export class GitHubRepository implements vscode.Disposable {
 	private _pullRequestModels = new Map<number, PullRequestModel>();
 	public readonly isGitHubDotCom: boolean;
 
+	private _onDidAddPullRequest: vscode.EventEmitter<PullRequestModel> = new vscode.EventEmitter();
+	public readonly onDidAddPullRequest: vscode.Event<PullRequestModel> = this._onDidAddPullRequest.event;
+
 	public get hub(): GitHub {
 		if (!this._hub) {
 			if (!this._initialized) {
@@ -110,6 +113,10 @@ export class GitHubRepository implements vscode.Disposable {
 
 	public equals(repo: GitHubRepository): boolean {
 		return this.remote.equals(repo.remote);
+	}
+
+	get pullRequestModels(): Map<number, PullRequestModel> {
+		return this._pullRequestModels;
 	}
 
 	public async ensureCommentsController(): Promise<void> {
@@ -235,7 +242,12 @@ export class GitHubRepository implements vscode.Disposable {
 		this._initialized = true;
 
 		if (!this._credentialStore.isAuthenticated(this.remote.authProviderId)) {
-			this._hub = await this._credentialStore.showSignInNotification(this.remote.authProviderId);
+			// We need auth now. (ex., a PR is already checked out)
+			// We can no longer wait until later for login to be done
+			await this._credentialStore.create();
+			if (!this._credentialStore.isAuthenticated(this.remote.authProviderId)) {
+				this._hub = await this._credentialStore.showSignInNotification(this.remote.authProviderId);
+			}
 		} else {
 			this._hub = this._credentialStore.getHub(this.remote.authProviderId);
 		}
@@ -351,14 +363,14 @@ export class GitHubRepository implements vscode.Disposable {
 		return undefined;
 	}
 
-	async getPullRequestForBranch(branch: string): Promise<PullRequestModel[] | undefined> {
+	async getPullRequestForBranch(remoteAndBranch: string): Promise<PullRequestModel[] | undefined> {
 		try {
 			Logger.debug(`Fetch pull requests for branch - enter`, GitHubRepository.ID);
 			const { octokit, remote } = await this.ensure();
 			const result = await octokit.pulls.list({
 				owner: remote.owner,
 				repo: remote.repositoryName,
-				head: `${remote.owner}:${branch}`,
+				head: remoteAndBranch
 			});
 
 			const pullRequests = result.data
@@ -663,6 +675,7 @@ export class GitHubRepository implements vscode.Disposable {
 			model = new PullRequestModel(this._telemetry, this, this.remote, pullRequest);
 			model.onDidInvalidate(() => this.getPullRequest(pullRequest.number));
 			this._pullRequestModels.set(pullRequest.number, model);
+			this._onDidAddPullRequest.fire(model);
 		}
 
 		return model;

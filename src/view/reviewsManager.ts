@@ -4,10 +4,12 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as vscode from 'vscode';
+import { Repository } from '../api/api';
 import { GitApiImpl } from '../api/api1';
 import { ITelemetry } from '../common/telemetry';
+import { CredentialStore } from '../github/credentials';
 import { RepositoriesManager } from '../github/repositoriesManager';
-import { GitContentProvider } from './gitContentProvider';
+import { GitContentFileSystemProvider } from './gitContentProvider';
 import { PullRequestChangesTreeDataProvider } from './prChangesTreeDataProvider';
 import { PullRequestsTreeDataProvider } from './prsTreeDataProvider';
 import { ReviewManager } from './reviewManager';
@@ -23,12 +25,13 @@ export class ReviewsManager {
 		private _prsTreeDataProvider: PullRequestsTreeDataProvider,
 		private _prFileChangesProvider: PullRequestChangesTreeDataProvider,
 		private _telemetry: ITelemetry,
+		credentialStore: CredentialStore,
 		gitApi: GitApiImpl,
 	) {
 		this._disposables = [];
-		const gitContentProvider = new GitContentProvider(gitApi);
+		const gitContentProvider = new GitContentFileSystemProvider(gitApi, credentialStore);
 		gitContentProvider.registerTextDocumentContentFallback(this.provideTextDocumentContent.bind(this));
-		this._disposables.push(vscode.workspace.registerTextDocumentContentProvider('review', gitContentProvider));
+		this._disposables.push(vscode.workspace.registerFileSystemProvider('review', gitContentProvider, { isReadonly: true }));
 		this.registerListeners();
 		this._disposables.push(this._prsTreeDataProvider);
 	}
@@ -62,6 +65,21 @@ export class ReviewsManager {
 			}
 		}
 		return '';
+	}
+
+	public addReviewManager(reviewManager: ReviewManager) {
+		this._reviewManagers.push(reviewManager);
+	}
+
+	public removeReviewManager(repo: Repository) {
+		const reviewManagerIndex = this._reviewManagers.findIndex(
+			manager => manager.repository.rootUri.toString() === repo.rootUri.toString(),
+		);
+		if (reviewManagerIndex) {
+			const manager = this._reviewManagers[reviewManagerIndex];
+			this._reviewManagers.splice(reviewManagerIndex);
+			manager.dispose();
+		}
 	}
 
 	dispose() {

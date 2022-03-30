@@ -72,6 +72,9 @@ export class RepositoriesManager implements vscode.Disposable {
 	private _onDidChangeState = new vscode.EventEmitter<void>();
 	readonly onDidChangeState: vscode.Event<void> = this._onDidChangeState.event;
 
+	private _onDidChangeFolderRepositories = new vscode.EventEmitter<void>();
+	readonly onDidChangeFolderRepositories = this._onDidChangeFolderRepositories.event;
+
 	private _state: ReposManagerState = ReposManagerState.Initializing;
 
 	constructor(
@@ -95,6 +98,8 @@ export class RepositoriesManager implements vscode.Disposable {
 	}
 
 	insertFolderManager(folderManager: FolderRepositoryManager) {
+		this._subs.push(folderManager.onDidLoadRepositories(state => (this.state = state)));
+
 		// Try to insert the new repository in workspace folder order
 		const workspaceFolders = vscode.workspace.workspaceFolders;
 		if (workspaceFolders) {
@@ -106,10 +111,12 @@ export class RepositoriesManager implements vscode.Disposable {
 				this._folderManagers = this._folderManagers.slice(0, index);
 				this._folderManagers.push(folderManager);
 				this._folderManagers.push(...arrayEnd);
+				this._onDidChangeFolderRepositories.fire();
 				return;
 			}
 		}
 		this._folderManagers.push(folderManager);
+		this._onDidChangeFolderRepositories.fire();
 	}
 
 	removeRepo(repo: Repository) {
@@ -120,6 +127,7 @@ export class RepositoriesManager implements vscode.Disposable {
 			const folderManager = this._folderManagers[existingFolderManagerIndex];
 			this._folderManagers.splice(existingFolderManagerIndex);
 			folderManager.dispose();
+			this._onDidChangeFolderRepositories.fire();
 		}
 	}
 

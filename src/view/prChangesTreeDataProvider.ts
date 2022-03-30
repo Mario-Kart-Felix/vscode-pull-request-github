@@ -4,17 +4,18 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as vscode from 'vscode';
-import { IComment } from '../common/comment';
 import Logger from '../common/logger';
+import { FILE_LIST_LAYOUT } from '../common/settingKeys';
 import { FolderRepositoryManager, SETTINGS_NAMESPACE } from '../github/folderRepositoryManager';
 import { PullRequestModel } from '../github/pullRequestModel';
+import { ReviewModel } from './reviewModel';
 import { DescriptionNode } from './treeNodes/descriptionNode';
-import { GitFileChangeNode, RemoteFileChangeNode } from './treeNodes/fileChangeNode';
+import { GitFileChangeNode } from './treeNodes/fileChangeNode';
 import { RepositoryChangesNode } from './treeNodes/repositoryChangesNode';
 import { BaseTreeNode, TreeNode } from './treeNodes/treeNode';
 
 export class PullRequestChangesTreeDataProvider extends vscode.Disposable implements vscode.TreeDataProvider<TreeNode>, BaseTreeNode {
-	private _onDidChangeTreeData = new vscode.EventEmitter<void>();
+	private _onDidChangeTreeData = new vscode.EventEmitter<TreeNode | void>();
 	readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 	private _disposables: vscode.Disposable[] = [];
 
@@ -35,11 +36,11 @@ export class PullRequestChangesTreeDataProvider extends vscode.Disposable implem
 
 		this._disposables.push(
 			vscode.workspace.onDidChangeConfiguration(async e => {
-				if (e.affectsConfiguration(`${SETTINGS_NAMESPACE}.fileListLayout`)) {
+				if (e.affectsConfiguration(`${SETTINGS_NAMESPACE}.${FILE_LIST_LAYOUT}`)) {
 					this._onDidChangeTreeData.fire();
 					const layout = vscode.workspace
 						.getConfiguration(`${SETTINGS_NAMESPACE}`)
-						.get<string>('fileListLayout');
+						.get<string>(FILE_LIST_LAYOUT);
 					await vscode.commands.executeCommand('setContext', 'fileListLayout:flat', layout === 'flat');
 				} else if (e.affectsConfiguration('git.openDiffOnClick')) {
 					this._onDidChangeTreeData.fire();
@@ -48,8 +49,8 @@ export class PullRequestChangesTreeDataProvider extends vscode.Disposable implem
 		);
 	}
 
-	refresh() {
-		this._onDidChangeTreeData.fire();
+	refresh(treeNode?: TreeNode) {
+		this._onDidChangeTreeData.fire(treeNode);
 	}
 
 	private updateViewTitle(): void {
@@ -68,17 +69,23 @@ export class PullRequestChangesTreeDataProvider extends vscode.Disposable implem
 
 	async addPrToView(
 		pullRequestManager: FolderRepositoryManager,
-		pullRequest: PullRequestModel,
-		localFileChanges: (GitFileChangeNode | RemoteFileChangeNode)[],
-		comments: IComment[],
+		pullRequestModel: PullRequestModel,
+		reviewModel: ReviewModel,
 		shouldReveal: boolean,
 	) {
+		if (this._pullRequestManagerMap.has(pullRequestManager)) {
+			const existingNode = this._pullRequestManagerMap.get(pullRequestManager);
+			if (existingNode && (existingNode.pullRequestModel === pullRequestModel)) {
+				return;
+			} else {
+				existingNode?.dispose();
+			}
+		}
 		const node: RepositoryChangesNode = new RepositoryChangesNode(
 			this,
-			pullRequest,
+			pullRequestModel,
 			pullRequestManager,
-			comments,
-			localFileChanges,
+			reviewModel
 		);
 		this._pullRequestManagerMap.set(pullRequestManager, node);
 		this.updateViewTitle();
@@ -92,6 +99,8 @@ export class PullRequestChangesTreeDataProvider extends vscode.Disposable implem
 	}
 
 	async removePrFromView(pullRequestManager: FolderRepositoryManager) {
+		const oldPR = this._pullRequestManagerMap.has(pullRequestManager) ? this._pullRequestManagerMap.get(pullRequestManager) : undefined;
+		oldPR?.dispose();
 		this._pullRequestManagerMap.delete(pullRequestManager);
 		this.updateViewTitle();
 		if (this._pullRequestManagerMap.size === 0) {
